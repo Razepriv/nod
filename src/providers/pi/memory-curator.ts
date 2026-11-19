@@ -65,16 +65,35 @@ function uncachedInput(payload: unknown) {
   };
 }
 
-function json(text: string) {
-  const parse = (body: string) => {
-    const start = body.indexOf('{');
+function closingBrace(text: string, start: number) {
+  let depth = 0;
+  let quoted = false;
+  let escaped = false;
+  for (let index = start; index < text.length; index++) {
+    const char = text[index];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') quoted = false;
+    } else if (char === '"') quoted = true;
+    else if (char === '{') depth++;
+    else if (char === '}' && --depth === 0) return index;
+  }
+  return -1;
+}
+
+function json(text: string): unknown {
+  for (let start = text.indexOf('{'); start >= 0; start = text.indexOf('{', start + 1)) {
+    const end = closingBrace(text, start);
+    if (end < 0) continue;
     try {
-      return start < 0 ? null : JSON.parse(body.slice(start, body.lastIndexOf('}') + 1));
+      const value: unknown = JSON.parse(text.slice(start, end + 1));
+      if (value && typeof value === 'object' && !Array.isArray(value)) return value;
     } catch {
-      return null;
+      continue;
     }
-  };
-  return parse(text) ?? parse(/```(?:json)?\s*([\s\S]*)```/.exec(text)?.[1] ?? '');
+  }
+  return null;
 }
 
 export function createPiMemoryCurator(options: {
