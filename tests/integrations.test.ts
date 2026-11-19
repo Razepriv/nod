@@ -3425,6 +3425,48 @@ test('hosted connection proof signs only the opened broker popup challenge for i
   }
 });
 
+test('a discarded app sign-in closes its connection browser attempt', async (t) => {
+  const browser = createIntegrationBrowser();
+  t.after(() => browser.close());
+  const proxy = createComposioProxy({
+    dataRoot: await mkdtemp(join(tmpdir(), 'nod-discarded-attempt-')),
+    ownerId: 'fixture-owner',
+    keyStore: installationKeyStore,
+    checkpoint: fixtureIdentityCheckpoint,
+    url: 'https://proxy.example.test',
+    request: async () => {
+      throw new Error('The synthetic connection service is offline.');
+    },
+    browser,
+  });
+  await proxy.initialize();
+  const provider = createComposioProvider({ proxy });
+  const callback = (state: string) => `http://localhost:4310/api/apps/callback?state=${state}`;
+  const discarded = await provider.authorize!(
+    'fixture-owner',
+    'gmail',
+    callback(randomBytes(32).toString('base64url')),
+  );
+  assert.equal(browser.owns(discarded.url), true);
+  await provider.deleteAccount(discarded.accountId, 'fixture-owner');
+  assert.equal(browser.owns(discarded.url), false);
+  await assert.rejects(fetch(discarded.url));
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const next = await provider.authorize!(
+      'fixture-owner',
+      'gmail',
+      callback(randomBytes(32).toString('base64url')),
+    );
+    await provider.deleteAccount(next.accountId, 'fixture-owner');
+  }
+  const last = await provider.authorize!(
+    'fixture-owner',
+    'gmail',
+    callback(randomBytes(32).toString('base64url')),
+  );
+  assert.equal(browser.owns(last.url), true);
+});
+
 test('connection bridge binds a single browser bootstrap to one installation attempt and closes on completion', async (t) => {
   const browser = createIntegrationBrowser();
   t.after(() => browser.close());
