@@ -955,7 +955,7 @@ for (const action of ['snapshot', 'click'] as const)
       browser.fail('snapshot', upstreamError);
       const before = browser.actions.length;
       await assert.rejects(
-        computer.act('fixture', { action, ...(action === 'click' ? { selector: 'button' } : {}) }),
+        computer.act('fixture', { action, selector: 'button' }),
         (error: unknown) => {
           assert.ok(error instanceof BrowserActionError);
           assert.equal(error.code, 'browser_observation_failed');
@@ -1153,6 +1153,25 @@ test('a card goes only into the approved fields on the approved sites and stays 
     await computer.fillCard({ ...entry, ...fresh });
     assert.equal(model.values.get('@e4'), card.cardNumber);
     assert.doesNotMatch((await computer.act('shop', { action: 'snapshot' })).text, /4242/);
+    await computer.act('shop', { action: 'open', url: 'https://1.1.1.1/thanks' });
+    model.selections = {
+      main: [
+        {
+          nodeId: 'selected-card',
+          backendDOMNodeId: 911,
+          role: { value: 'spinbutton' },
+          name: { value: 'Synthetic payment method' },
+          value: { value: Number(card.cardNumber) },
+          properties: [{ name: 'editable', value: { value: 'plaintext' } }],
+        },
+      ],
+      pay: [],
+      ads: [],
+    };
+    const selected = await computer.currentPage('shop');
+    assert.doesNotMatch(JSON.stringify(selected), new RegExp(card.cardNumber));
+    assert.match(selected.currentSelections?.incomplete ?? '', /selected value is hidden/);
+    assert.equal(selected.currentSelections?.values[0]?.value, '[redacted]');
   } finally {
     await computer.dispose();
     await devtools.close();
@@ -2145,6 +2164,116 @@ test('visual browser actions fence the session when releasing the pointer fails'
 });
 
 describe('native browser controls', { concurrency: 3 }, () => {
+  test(
+    'the browser bridge reports invalid wait conditions and keeps the page usable',
+    {
+      skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true' || process.platform !== 'linux',
+      timeout: 30_000,
+    },
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'nod-wait-'));
+      const server = createHttpServer((_request, response) => {
+        response.setHeader('content-type', 'text/html');
+        response.end('<p>Results ready</p>');
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      const bridge = await harness({
+        computer: createAgentBrowserComputer({
+          ...containerBrowserOptions(directory),
+          privateNetwork: true,
+        }),
+      });
+      const computer = bridge.client('/synthetic/browser-wait');
+      try {
+        const url = `http://127.0.0.1:${address.port}/`;
+        await computer.act('fixture', { action: 'open', url });
+        for (const args of [{ waitMs: 3000 }, { text: 'Results ready', load: 'load' as const }])
+          await assert.rejects(computer.act('fixture', { action: 'wait', ...args }), {
+            name: 'BrowserActionError',
+            code: 'browser_wait_condition_required',
+          });
+        const ready = await computer.act('fixture', { action: 'wait', text: 'Results ready' });
+        assert.equal(ready.url, url);
+        assert.match(ready.text, /Results ready/);
+        assert.doesNotMatch(ready.text, /condition was not met/);
+        const timeout = await computer.act('fixture', {
+          action: 'wait',
+          text: 'An absent result',
+          waitMs: 50,
+        });
+        assert.equal(timeout.url, url);
+        assert.match(timeout.text, /condition was not met/);
+        assert.match(timeout.text, /Results ready/);
+      } finally {
+        await bridge.close();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test(
+    'a rejected snapshot scope preserves the page and reports its reason across the bridge',
+    {
+      skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true' || process.platform !== 'linux',
+      timeout: 30_000,
+    },
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'nod-snapshot-scope-'));
+      const server = createHttpServer((_request, response) => {
+        response.setHeader('content-type', 'text/html');
+        response.end(
+          '<article id="summary"><button>Continue</button></article><aside>Outside scope</aside>',
+        );
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      const bridge = await harness({
+        computer: createAgentBrowserComputer({
+          ...containerBrowserOptions(directory),
+          privateNetwork: true,
+        }),
+      });
+      const computer = bridge.client('/synthetic/snapshot-scope');
+      try {
+        const url = `http://127.0.0.1:${address.port}/`;
+        await computer.act('fixture', { action: 'open', url });
+        const missing = '[data-region="synthetic-private-value"]';
+        const snapshot = (selector?: string) =>
+          computer.act('fixture', { action: 'snapshot', selector });
+        const rejectScope = (selector: string, code: string) =>
+          assert.rejects(snapshot(selector), (error: unknown) => {
+            assert.ok(error instanceof BrowserActionError);
+            assert.equal(error.code, code);
+            assert.equal(error.detail, undefined);
+            assert.doesNotMatch(error.message, /synthetic-private-value/);
+            return true;
+          });
+        await rejectScope(missing, 'browser_snapshot_scope_missing');
+        assert.ok((await computer.screenshot('fixture'))?.length);
+        await rejectScope(missing, 'browser_snapshot_scope_missing');
+        await rejectScope(
+          '[data-region="synthetic-private-value"]]',
+          'browser_snapshot_scope_invalid',
+        );
+        const scoped = await snapshot('#summary');
+        assert.match(scoped.text, /Continue/);
+        assert.doesNotMatch(scoped.text, /Outside scope/);
+        const recovered = await snapshot();
+        assert.equal(recovered.url, url);
+        assert.match(recovered.text, /Continue/);
+        assert.match(recovered.text, /Outside scope/);
+      } finally {
+        await bridge.close();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
   test(
     'native container browser stays responsive, streams live frames and refuses passkeys after heavy stderr output',
     {
@@ -6678,6 +6807,453 @@ test(
   },
 );
 
+test('selection state and replay bindings cross the browser worker for clicks and uploads', async () => {
+  const binding = '1'.repeat(64);
+  const values = [{ role: 'checkbox', name: 'Include vacancies', checked: 'false' as const }];
+  const seen: unknown[] = [];
+  const fixture = await harness({
+    computer: {
+      ...fakeComputer(),
+      currentPage: async () => ({
+        origin: 'https://reports.example.test',
+        url: 'https://reports.example.test/',
+        currentSelections: { binding, values },
+      }),
+      act: async (_id, input) => {
+        seen.push(input);
+        return { text: 'Synthetic click', url: 'https://reports.example.test/' };
+      },
+      upload: async (_id, input) => {
+        seen.push(input);
+        return { text: 'Synthetic upload', url: 'https://reports.example.test/' };
+      },
+    },
+  });
+  try {
+    const client = fixture.client('/synthetic/selection-binding');
+    assert.deepEqual((await client.currentPage('task')).currentSelections, { binding, values });
+    await client.act('task', { action: 'click', selector: '#report', expectSelections: binding });
+    await client.upload('task', {
+      selector: '#file',
+      name: 'synthetic.txt',
+      bytes: Buffer.from('synthetic'),
+      expectSelections: binding,
+    });
+    assert.equal(seen.length, 2);
+    for (const input of seen) assert.equal((input as BrowserAction).expectSelections, binding);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test('native selection trees keep false, mixed and empty states and reject incomplete values', async () => {
+  const node = (
+    id: number,
+    role: string,
+    value?: unknown,
+    properties: Record<string, unknown> = {},
+    parentId?: number,
+  ) => ({
+    nodeId: String(id),
+    backendDOMNodeId: id,
+    ...(parentId ? { parentId: String(parentId) } : {}),
+    role: { value: role },
+    name: { value: `Synthetic ${id}` },
+    ...(value === undefined ? {} : { value: { value } }),
+    properties: Object.entries(properties).map(([name, value]) => ({ name, value: { value } })),
+  });
+  const model: DevtoolsModel = {
+    document: 'selection-document',
+    frames: [{ id: 'main', session: 'page', origin: 'https://reports.example.test' }],
+    frameOf: {},
+    values: new Map(),
+    selections: {
+      main: [
+        node(1, 'spinbutton', 0),
+        node(2, 'checkbox', undefined, { checked: 'false' }),
+        node(3, 'checkbox', undefined, { checked: 'mixed' }),
+        node(4, 'listbox'),
+        node(5, 'option', undefined, { selected: false }, 4),
+        node(6, 'textbox', 'Synthetic private text'),
+        node(7, 'combobox', 'Synthetic editable text', { editable: 'plaintext' }),
+      ],
+    },
+  };
+  const fixture = await fakeDevtools(model);
+  const inspector = await openDevtools(fixture.url, 'fixture-target');
+  try {
+    const [frame] = await inspector.selections();
+    assert.ok(frame);
+    assert.equal(frame.document, model.document);
+    assert.deepEqual(
+      frame.values.map(({ role, value, checked, selectedCount }) => ({
+        role,
+        value,
+        checked,
+        selectedCount,
+      })),
+      [
+        { role: 'spinbutton', value: '0', checked: undefined, selectedCount: undefined },
+        { role: 'checkbox', value: undefined, checked: 'false', selectedCount: undefined },
+        { role: 'checkbox', value: undefined, checked: 'mixed', selectedCount: undefined },
+        { role: 'listbox', value: undefined, checked: undefined, selectedCount: 0 },
+      ],
+    );
+    assert.doesNotMatch(JSON.stringify(frame), /Synthetic private text|Synthetic editable text/);
+    model.selections!.main = [node(1, 'combobox')];
+    await assert.rejects(inspector.selections(), /did not report a current value/);
+    model.selections!.main = [node(1, 'slider')];
+    await assert.rejects(inspector.selections(), /did not report a current value/);
+    model.selections!.main = [node(1, 'checkbox')];
+    await assert.rejects(inspector.selections(), /did not report a current checked state/);
+    model.selections!.main = Array.from({ length: 257 }, (_, id) =>
+      node(id, 'checkbox', undefined, { checked: false }),
+    );
+    await assert.rejects(inspector.selections(), /more than 256/);
+    model.selections!.main = [node(1, 'combobox', 'x'.repeat(64_001))];
+    await assert.rejects(inspector.selections(), /exceed 64000/);
+    model.selectionError = 'Synthetic native capture failure';
+    await assert.rejects(inspector.selections(), /Synthetic native capture failure/);
+  } finally {
+    inspector.close();
+    await fixture.close();
+  }
+});
+
+test(
+  'selection capture stops promptly, bounds public values and closes a stalled inspector',
+  { timeout: 15_000 },
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'nod-selection-capture-'));
+    const model: DevtoolsModel = {
+      document: 'selection-document',
+      frames: [{ id: 'main', session: 'page', origin: 'https://1.1.1.1' }],
+      frameOf: {},
+      values: new Map(),
+      selections: { main: [] },
+    };
+    const fixture = await fakeDevtools(model);
+    const computer = createBrowserFixture({
+      dataRoot: directory,
+      run: async (_executable, args) => {
+        const command = args.slice(args.indexOf('--idle-timeout') + 2);
+        const data: Record<string, unknown> =
+          command[0] === 'get' && command[1] === 'url'
+            ? { url: 'https://1.1.1.1/' }
+            : command[0] === 'get' && command[1] === 'cdp-url'
+              ? { cdpUrl: fixture.url }
+              : command[0] === 'snapshot'
+                ? { snapshot: '- button "Generate report" [ref=e1]' }
+                : {};
+        if (command[0] === 'screenshot') await writeFile(command[1]!, 'synthetic screen');
+        return { stdout: JSON.stringify({ success: true, data }), stderr: '', exitCode: 0 };
+      },
+    });
+    try {
+      await computer.act('selection', { action: 'open', url: 'https://1.1.1.1/' });
+      const selection = (value: string) => ({
+        nodeId: '1',
+        backendDOMNodeId: 1,
+        role: { value: 'combobox' },
+        name: { value: 'Company' },
+        value: { value },
+      });
+      model.selections!.main = [selection('x'.repeat(301))];
+      const first = await computer.currentPage('selection');
+      assert.match(first.currentSelections?.incomplete ?? '', /description limit/);
+      assert.equal(first.currentSelections?.values[0]?.value?.length, 300);
+      model.selections!.main = [selection('x'.repeat(300) + 'y')];
+      const changed = await computer.currentPage('selection');
+      assert.deepEqual(changed.currentSelections?.values, first.currentSelections?.values);
+      assert.notEqual(changed.currentSelections?.binding, first.currentSelections?.binding);
+      model.holdSelections = true;
+      const entered = deferred();
+      model.onSelections = () => entered.resolve();
+      const controller = new AbortController();
+      const stopped = computer.currentPage('selection', undefined, controller.signal);
+      const rejected = assert.rejects(stopped, /Synthetic selection stop/);
+      await entered.promise;
+      const at = Date.now();
+      controller.abort(new Error('Synthetic selection stop'));
+      await rejected;
+      assert.ok(Date.now() - at < 1000, 'Stop must not wait for the inspector deadline.');
+      for (let attempt = 0; fixture.connections() && attempt < 50; attempt++) await delay(10);
+      assert.equal(fixture.connections(), 0);
+      const timed = await computer.currentPage('selection');
+      assert.equal(timed.currentSelections?.binding, undefined);
+      assert.match(
+        timed.currentSelections?.incomplete ?? '',
+        /could not be read.*tim(e|ed)\s?out/i,
+      );
+      for (let attempt = 0; fixture.connections() && attempt < 50; attempt++) await delay(10);
+      assert.equal(fixture.connections(), 0);
+    } finally {
+      await computer.dispose();
+      await fixture.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'native browser confirmations bind selected company and period without changing the action identity',
+  { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 90_000 },
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'nod-selection-native-'));
+    const server = createHttpServer((request, response) => {
+      response.setHeader('content-type', 'text/html');
+      if (request.url === '/frame') {
+        response.end(
+          '<label>Department<select id="department"><option selected>One</option><option>Two</option></select></label>',
+        );
+        return;
+      }
+      if (request.url?.startsWith('/remote-frame')) {
+        response.end(
+          `<label>Branch<select><option selected>${request.url.includes('South') ? 'South' : 'North'}</option></select></label>`,
+        );
+        return;
+      }
+      response.end(`<form onsubmit="event.preventDefault();window.syntheticReports=(window.syntheticReports||[]).concat(this.elements.month.value);window.syntheticThresholds=(window.syntheticThresholds||[]).concat(this.elements.threshold.value)">
+        <label>Company<select name="company"><option>A</option><option selected>B</option></select></label>
+        <label>Month<select name="month" id="month"><option>October</option><option selected>November</option></select></label>
+        <label>Year<select name="year"><option>2025</option><option selected>2026</option></select></label>
+        <label>Threshold<input id="threshold" name="threshold" type="range" min="0" max="100" value="10"></label><label>Copies<input type="number" value="0"></label><label>Include vacancies<input type="checkbox"></label>
+        <div id="numeric-period" role="spinbutton" aria-label="Numeric period" aria-valuenow="11" aria-valuetext="Reporting month" tabindex="0"></div>
+        <input aria-label="Private free text" value="Synthetic free text"><input type="password" value="Synthetic password">
+        <button id="report">Generate report</button></form><iframe src="/frame" title="Synthetic department"></iframe>
+        <iframe id="remote-frame" src="${origin.replace('127.0.0.1', 'localhost')}/remote-frame?North" title="Synthetic branch"></iframe><button id="dialog" onclick="window.syntheticDialogAccepted=confirm('Generate the selected report?')">Confirm report</button>`);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    let changeFormDuringCapture = false;
+    const computer = createAgentBrowserComputer({
+      dataRoot: directory,
+      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+      privateNetwork: true,
+      headless: true,
+      daemonCommand: async (path, command, signal, timeoutMs, maxBytes) => {
+        if (changeFormDuringCapture && command.action === 'cdp_url' && signal) {
+          changeFormDuringCapture = false;
+          await existingDaemonCommand(
+            path,
+            {
+              action: 'evaluate',
+              script: "document.querySelector('form').action='/changed-report'",
+            },
+            signal,
+          );
+        }
+        return existingDaemonCommand(path, command, signal, timeoutMs, maxBytes);
+      },
+    });
+    try {
+      for (const kind of ['css', 'ref']) {
+        const snapshot = await computer.act('selection', { action: 'open', url: origin });
+        const ref = /button "Generate report" \[ref=(e\d+)\]/.exec(snapshot.text)?.[1];
+        assert.ok(ref);
+        const step = { action: 'click', selector: kind === 'ref' ? `@${ref}` : '#report' } as const;
+        const before = await computer.currentPage('selection', step);
+        assert.ok(before.currentSelections?.binding, before.currentSelections?.incomplete);
+        assert.equal(before.currentSelections.incomplete, undefined);
+        assert.equal(
+          (await computer.currentPage('selection', step)).currentSelections?.binding,
+          before.currentSelections.binding,
+        );
+        const values = before.currentSelections.values;
+        for (const [name, value] of [
+          ['Company', 'B'],
+          ['Month', 'November'],
+          ['Year', '2026'],
+          ['Copies', '0'],
+        ])
+          assert.ok(
+            values.some((item) => item.name === name && item.value === value),
+            `${name} must have its current value.`,
+          );
+        assert.ok(
+          values.some((item) => item.name === 'Include vacancies' && item.checked === 'false'),
+        );
+        assert.ok(values.some((item) => item.name === 'Department' && item.value === 'One'));
+        assert.ok(
+          values.some(
+            (item) => item.role === 'slider' && item.name === 'Threshold' && item.value === '10',
+          ),
+        );
+        assert.ok(values.some((item) => item.name === 'Branch' && item.value === 'North'));
+        assert.doesNotMatch(
+          JSON.stringify(values),
+          /Synthetic free text|Synthetic password|backendDOMNodeId|nativeValue|valueText|"node"|"parent"/,
+        );
+        await computer.act('selection', {
+          ...step,
+          expectTarget: before.target,
+          expectSelections: before.currentSelections.binding,
+        });
+        await computer.act('selection', { action: 'select', selector: '#month', text: 'October' });
+        const changed = await computer.currentPage('selection', step);
+        assert.equal(changed.target, before.target);
+        assert.notEqual(changed.currentSelections?.binding, before.currentSelections.binding);
+        await assert.rejects(
+          computer.act('selection', {
+            ...step,
+            expectTarget: before.target,
+            expectSelections: before.currentSelections.binding,
+          }),
+          (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
+        );
+        const reports = await computer.act('selection', {
+          action: 'evaluate',
+          script: 'window.syntheticReports',
+          readOnly: true,
+        });
+        assert.deepEqual(JSON.parse(reports.text.slice(reports.text.indexOf('\n') + 1)), [
+          'November',
+        ]);
+        await computer.act('selection', {
+          action: 'evaluate',
+          script:
+            "document.querySelector('iframe').contentDocument.querySelector('select').value='Two'",
+        });
+        const frameChanged = await computer.currentPage('selection', step);
+        assert.notEqual(
+          frameChanged.currentSelections?.binding,
+          changed.currentSelections?.binding,
+        );
+        assert.equal(frameChanged.target, before.target);
+        await computer.act('selection', {
+          action: 'evaluate',
+          script:
+            "document.querySelector('#remote-frame').src=document.querySelector('#remote-frame').src.replace('North','South')",
+        });
+        const remoteChanged = await computer.currentPage('selection', step);
+        assert.equal(remoteChanged.currentSelections?.incomplete, undefined);
+        assert.ok(
+          remoteChanged.currentSelections?.values.some(
+            (item) => item.name === 'Branch' && item.value === 'South',
+          ),
+        );
+        assert.notEqual(
+          remoteChanged.currentSelections?.binding,
+          frameChanged.currentSelections?.binding,
+        );
+        assert.equal(remoteChanged.target, before.target);
+        await computer.act('selection', {
+          action: 'evaluate',
+          script: "document.querySelector('#numeric-period').setAttribute('aria-valuenow','10')",
+        });
+        const numericChanged = await computer.currentPage('selection', step);
+        assert.deepEqual(
+          numericChanged.currentSelections?.values,
+          remoteChanged.currentSelections?.values,
+        );
+        assert.notEqual(
+          numericChanged.currentSelections?.binding,
+          remoteChanged.currentSelections?.binding,
+        );
+        await assert.rejects(
+          computer.act('selection', {
+            ...step,
+            expectTarget: remoteChanged.target,
+            expectSelections: remoteChanged.currentSelections?.binding,
+          }),
+          (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
+        );
+        await computer.act('selection', {
+          action: 'evaluate',
+          script: "document.querySelector('#threshold').value='20'",
+        });
+        const rangeChanged = await computer.currentPage('selection', step);
+        assert.equal(rangeChanged.target, numericChanged.target);
+        assert.notEqual(
+          rangeChanged.currentSelections?.binding,
+          numericChanged.currentSelections?.binding,
+        );
+        await assert.rejects(
+          computer.act('selection', {
+            ...step,
+            expectTarget: numericChanged.target,
+            expectSelections: numericChanged.currentSelections?.binding,
+          }),
+          (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
+        );
+        changeFormDuringCapture = true;
+        await assert.rejects(
+          computer.act('selection', {
+            ...step,
+            expectTarget: rangeChanged.target,
+            expectSelections: rangeChanged.currentSelections?.binding,
+          }),
+          (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
+        );
+        assert.equal(changeFormDuringCapture, false);
+        const final = await computer.act('selection', {
+          action: 'evaluate',
+          script: 'window.syntheticReports',
+          readOnly: true,
+        });
+        assert.deepEqual(JSON.parse(final.text.slice(final.text.indexOf('\n') + 1)), ['November']);
+        const thresholds = await computer.act('selection', {
+          action: 'evaluate',
+          script: 'window.syntheticThresholds',
+          readOnly: true,
+        });
+        assert.deepEqual(JSON.parse(thresholds.text.slice(thresholds.text.indexOf('\n') + 1)), [
+          '10',
+        ]);
+      }
+      await computer.act('selection', { action: 'click', selector: '#dialog' });
+      const modalAt = Date.now();
+      const modal = await computer.currentPage('selection', { action: 'accept_dialog' });
+      assert.ok(
+        Date.now() - modalAt < 1500,
+        'An open dialog must not wait for a blocked accessibility read.',
+      );
+      assert.equal(modal.currentSelections?.binding, undefined);
+      assert.match(modal.currentSelections?.incomplete ?? '', /JavaScript dialog is open/);
+      await computer.act('selection', {
+        action: 'accept_dialog',
+        expectOrigin: modal.origin,
+        expectUrl: modal.url,
+        expectTarget: modal.target,
+      });
+      const accepted = await computer.act('selection', {
+        action: 'evaluate',
+        script: 'window.syntheticDialogAccepted',
+        readOnly: true,
+      });
+      assert.equal(JSON.parse(accepted.text.slice(accepted.text.indexOf('\n') + 1)), true);
+      const step = { action: 'click', selector: '#report' } as const;
+      const saved = await computer.currentPage('selection', step);
+      const restarted = createAgentBrowserComputer({
+        dataRoot: directory,
+        browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+        privateNetwork: true,
+        headless: true,
+      });
+      try {
+        const restored = await restarted.currentPage('selection', step);
+        assert.deepEqual(restored.currentSelections?.values, saved.currentSelections?.values);
+        assert.notEqual(restored.currentSelections?.binding, saved.currentSelections?.binding);
+        await assert.rejects(
+          restarted.act('selection', {
+            ...step,
+            expectSelections: saved.currentSelections?.binding,
+          }),
+          (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
+        );
+      } finally {
+        await restarted.dispose();
+      }
+    } finally {
+      await computer.dispose();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
 test('chat retires reply targets without losing drafts or duplicating ambiguous sends', async () => {
   const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
     timeoutMs: 20_000,
@@ -7311,6 +7887,193 @@ test('chat resumes history after a failed focus check and cancels pending focus 
   assert.equal(result.exitCode, 0, result.stdout + result.stderr);
 });
 
+test('chat state reads make progress during refresh events and reject late replies after reset', async () => {
+  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+    timeoutMs: 20_000,
+    input: String.raw`
+      import assert from 'node:assert/strict';
+      import { JSDOM } from 'jsdom';
+      const dom = new JSDOM('<!doctype html><div id="root"></div>', {
+        url: 'https://nod.fixture.invalid', pretendToBeVisual: true,
+      });
+      Object.assign(globalThis, {
+        window: dom.window, document: dom.window.document,
+        IS_REACT_ACT_ENVIRONMENT: true, localStorage: dom.window.localStorage,
+        getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
+        requestAnimationFrame: dom.window.requestAnimationFrame.bind(dom.window),
+        cancelAnimationFrame: dom.window.cancelAnimationFrame.bind(dom.window),
+      });
+      for (const name of ['Node', 'NodeFilter', 'Element', 'HTMLElement', 'HTMLInputElement',
+        'HTMLButtonElement', 'MutationObserver', 'Event', 'KeyboardEvent', 'CustomEvent', 'DOMParser'])
+        globalThis[name] = dom.window[name];
+      Object.defineProperty(globalThis, 'navigator', { configurable: true, value: dom.window.navigator });
+      window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+      HTMLElement.prototype.scrollTo = () => {};
+      HTMLElement.prototype.scrollIntoView = () => {};
+      const sources = [];
+      globalThis.EventSource = class {
+        static CLOSED = 2;
+        readyState = 1;
+        constructor() { sources.push(this); }
+        close() { this.readyState = 2; }
+      };
+      const reads = [];
+      let ownerId = 'synthetic-owner';
+      let expireRead = false;
+      const deadlines = [];
+      AbortSignal.timeout = () => {
+        const controller = new AbortController();
+        deadlines.push(controller);
+        return controller.signal;
+      };
+      const threadId = '00000000-0000-4000-8000-000000000901';
+      const nextThreadId = '00000000-0000-4000-8000-000000000902';
+      const message = (id, text) => ({ id, role: 'assistant', text, attachments: [],
+        turnId: null, createdAt: '2026-11-19T12:00:00Z' });
+      const state = (messages, current = threadId) => ({
+        threadId: current, turns: [], activity: [], tasks: [],
+        verificationRequests: [], configuration: { llmReady: true }, messages,
+      });
+      globalThis.fetch = async (path, options = {}) => {
+        if (path === '/api/session') return Response.json({
+          user: { id: ownerId, name: 'Synthetic', email: null, avatarUrl: null },
+          settings: { theme: 'system', onboardingCompleted: true, usageData: false, traces: false },
+          capabilities: { developer: false, traces: false },
+        });
+        if (path === '/api/state') return new Promise((resolve, reject) => {
+          reads.push({ resolve, signal: options.signal });
+          if (expireRead) options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+        });
+        if (path === '/api/conversation/reset') return Response.json({ ok: true, threadId: nextThreadId });
+        if (path === '/api/apps') return Response.json([]);
+        if (path === '/api/trust') return Response.json({});
+        if (path === '/api/speech') return Response.json({ transcription: true });
+        if (path === '/api/onboarding/introduction') return Response.json({ messageId: null });
+        throw new Error('Unexpected request: ' + path);
+      };
+      const { createElement, act, StrictMode } = await import('react');
+      const { createRoot } = await import('react-dom/client');
+      const { sessionStore } = await import('./src/web/lib/session.ts');
+      const { useAppState } = await import('./src/web/hooks/use-app-state.ts');
+      const { Chat } = await import('./src/web/pages/chat.tsx');
+      await sessionStore.refresh();
+      let app;
+      function Screen() {
+        app = useAppState(ownerId);
+        return app.state ? createElement(Chat, {
+          ownerId, state: app.state, streams: app.streams,
+          refresh: app.refresh, resetConversation: app.resetConversation,
+        }) : createElement('p', null, 'Loading');
+      }
+      let root = createRoot(document.getElementById('root'));
+      const event = data => sources.at(-1).onmessage({ data: JSON.stringify(data) });
+      const complete = (read, value) => act(async () => read.resolve(Response.json(value)));
+      try {
+        await act(async () => root.render(createElement(Screen)));
+        const first = reads[0];
+        await act(async () => sources[0].onopen());
+        for (let index = 0; index < 20; index++)
+          await act(async () => event({ type: 'refresh' }));
+        const saved = message('saved-reply', 'Synthetic saved reply');
+        await complete(first, state([saved]));
+        assert.ok(document.querySelector('[data-message-id="saved-reply"]'),
+          'The completed state read must show its saved reply during repeated updates.');
+        assert.equal(first.signal.aborted, false);
+        assert.equal(reads.length, 2);
+        let refreshed = false;
+        const awaitedRefresh = app.refresh().then(() => { refreshed = true; });
+        assert.equal(refreshed, false);
+        const activity = [{ turnId: 'synthetic-work', taskId: null, title: null,
+          step: null, site: null, since: '2026-11-19T12:00:00Z' }];
+        await act(async () => event({ type: 'activity', items: activity }));
+        const approval = { ...message('pending-approval', 'Synthetic pending change'),
+          approval: { id: 'synthetic-approval', state: 'pending', title: 'Save change', app: 'Nod', slug: 'nod' } };
+        await complete(reads[1], state([saved, message('newer-reply', 'Synthetic newer reply'), approval]));
+        assert.ok(document.querySelector('[data-message-id="newer-reply"]'));
+        assert.ok(document.querySelector('[data-message-id="pending-approval"] button'));
+        assert.deepEqual(app.state.activity, activity);
+        assert.equal(refreshed, false);
+        await complete(reads.at(-1), state([saved, message('awaited-reply', 'Synthetic awaited reply'), approval]));
+        await awaitedRefresh;
+        assert.equal(refreshed, true);
+        assert.ok(document.querySelector('[data-message-id="awaited-reply"]'));
+        await act(async () => event({ type: 'refresh' }));
+        const failed = reads.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        await act(async () => failed.resolve(Response.json({ error: 'Synthetic state read failed' }, { status: 503 })));
+        assert.match(app.error, /Synthetic state read failed/);
+        assert.ok(document.querySelector('[data-message-id="pending-approval"] button'));
+        await complete(reads.at(-1), state([saved, message('recovered-reply', 'Synthetic recovered reply')]));
+        assert.equal(app.error, '');
+        assert.ok(document.querySelector('[data-message-id="recovered-reply"]'));
+        expireRead = true;
+        await act(async () => event({ type: 'refresh' }));
+        expireRead = false;
+        const timedOut = reads.at(-1);
+        const deadline = deadlines.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        const beforeTimeout = reads.length;
+        await act(async () => deadline.abort(new DOMException('Synthetic deadline', 'TimeoutError')));
+        assert.equal(timedOut.signal.aborted, true);
+        assert.match(app.error, /did not finish within 15 seconds/);
+        assert.equal(reads.length, beforeTimeout + 1);
+        assert.equal(reads.at(-1).signal.aborted, false);
+        await complete(reads.at(-1), state([message('after-timeout', 'Synthetic reply after timeout')]));
+        assert.equal(app.error, '');
+        assert.ok(document.querySelector('[data-message-id="after-timeout"]'));
+        await complete(timedOut, state([message('timed-out-reply', 'Synthetic expired reply')]));
+        assert.equal(document.querySelector('[data-message-id="timed-out-reply"]'), null);
+        await act(async () => event({ type: 'refresh' }));
+        const old = reads.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        await act(async () => app.resetConversation(threadId));
+        assert.equal(app.state.threadId, nextThreadId);
+        assert.equal(app.error, '');
+        assert.equal(document.querySelector('[data-message-id="saved-reply"]'), null);
+        await act(async () => event({ type: 'refresh' }));
+        assert.equal(old.signal.aborted, true);
+        assert.notEqual(reads.at(-1), old);
+        await complete(reads.at(-1), state([message('new-thread-reply', 'Synthetic new conversation')], nextThreadId));
+        assert.ok(document.querySelector('[data-message-id="new-thread-reply"]'));
+        const resetReads = reads.length;
+        await complete(old, state([message('late-reply', 'Synthetic late reply')]));
+        assert.equal(app.state.threadId, nextThreadId);
+        assert.equal(document.querySelector('[data-message-id="late-reply"]'), null);
+        assert.equal(reads.length, resetReads);
+        await act(async () => event({ type: 'refresh' }));
+        const unmounted = reads.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        await act(async () => root.unmount());
+        assert.equal(unmounted.signal.aborted, true);
+        const count = reads.length;
+        const retiredSource = sources[0];
+        sessionStore.invalidate();
+        ownerId = 'other-synthetic-owner';
+        await sessionStore.refresh();
+        root = createRoot(document.getElementById('root'));
+        await act(async () => root.render(createElement(StrictMode, null, createElement(Screen, { key: ownerId }))));
+        assert.equal(reads.length, count + 2);
+        const abandoned = reads.at(-2);
+        assert.equal(abandoned.signal.aborted, true);
+        await act(async () => retiredSource.onmessage({ data: JSON.stringify({ type: 'refresh' }) }));
+        await complete(unmounted, state([message('unmounted-reply', 'Synthetic unmounted reply')]));
+        assert.equal(reads.length, count + 2);
+        await complete(reads.at(-1), state([message('other-owner-reply', 'Synthetic other owner reply')]));
+        assert.ok(document.querySelector('[data-message-id="other-owner-reply"]'));
+        await complete(abandoned, state([message('abandoned-reply', 'Synthetic abandoned reply')]));
+        assert.equal(reads.length, count + 2);
+        assert.equal(document.querySelector('[data-message-id="abandoned-reply"]'), null);
+        assert.equal(document.querySelector('[data-message-id="unmounted-reply"]'), null);
+        assert.equal(document.querySelector('[data-message-id="saved-reply"]'), null);
+      } finally {
+        await act(async () => root.unmount());
+        dom.window.close();
+      }
+    `,
+  });
+  assert.equal(result.exitCode, 0, result.stdout + result.stderr);
+});
+
 test('chat shows pending sends and active work before a model step', async () => {
   const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
     timeoutMs: 20_000,
@@ -7554,7 +8317,7 @@ test('analytics follow visible Settings sections, Apps tabs and the Scheduled pa
       const events = event => sent.filter(item => item.event === event);
       const settings = () => events('settings_viewed').map(item => item.properties.tab);
       const tabs = () => events('tab_viewed').map(item => [item.properties.page, item.properties.tab]);
-      const sectionLabels = ['General', 'Notifications', 'Models', 'Voice & audio', 'Memory', 'Privacy & data'];
+      const sectionLabels = ['General', 'Notifications', 'Models', 'Voice & audio', 'Memory', 'Computer use', 'Privacy & data'];
       try {
         await act(async () => root.render(createElement(AccountSettings, {
           account, open: true, initialTab: 'General', openRequest: 0, onOpenChange() {},
@@ -7564,9 +8327,9 @@ test('analytics follow visible Settings sections, Apps tabs and the Scheduled pa
         const navigation = [...document.querySelectorAll('.settings-nav-item')];
         assert.deepEqual(navigation.map(item => item.textContent), sectionLabels);
         for (const item of navigation.slice(1)) await act(async () => item.click());
-        assert.deepEqual(settings(), ['general', 'notifications', 'models', 'voice', 'memory', 'privacy']);
+        assert.deepEqual(settings(), ['general', 'notifications', 'models', 'voice', 'memory', 'computer', 'privacy']);
         await act(async () => navigation.at(-1).click());
-        assert.equal(settings().length, 6);
+        assert.equal(settings().length, 7);
         const scroller = document.querySelector('.settings-scroll');
         Object.defineProperties(scroller, { scrollHeight: { value: 2000 }, clientHeight: { value: 400 } });
         document.querySelectorAll('.settings-category > h2').forEach((heading, index) => {
@@ -7584,7 +8347,7 @@ test('analytics follow visible Settings sections, Apps tabs and the Scheduled pa
         consent(true);
         await act(async () => navigation[3].click());
         assert.equal(settings().at(-1), 'voice');
-        for (const path of ['/settings', '/settings/notifications', '/settings/models', '/settings/voice', '/settings/memory', '/settings/privacy']) {
+        for (const path of ['/settings', '/settings/notifications', '/settings/models', '/settings/voice', '/settings/memory', '/settings/computer-use', '/settings/privacy']) {
           window.history.replaceState(null, '', path);
           capturePageview(path);
           assert.equal(events('$pageview').at(-1).properties.route, '/settings');

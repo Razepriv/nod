@@ -17,6 +17,7 @@ import {
   screen,
   session,
   shell,
+  systemPreferences,
   Tray,
   utilityProcess,
 } from 'electron';
@@ -42,6 +43,8 @@ import {
   watchAssistantMessages,
 } from './notifications.mjs';
 import { createAppPreferencesStore } from './app-preferences.mjs';
+import { createComputerHelper } from './computer-helper.mjs';
+import { createComputerOverlay } from './computer-overlay.mjs';
 import { createChatReadCursorStore } from './chat-read-cursors.mjs';
 import { registerArtifactFileHandlers } from './artifact-file-handlers.mjs';
 import { saveArtifactDownload } from './downloads.mjs';
@@ -118,6 +121,46 @@ app.setPath(
   developmentDataRoot || join(app.getPath('appData'), testInstall ? 'nod Setup Test' : 'nod'),
 );
 const profileRoot = join(app.getPath('userData'), 'profiles', 'local');
+const agentDesktop = app.isPackaged
+  ? process.platform === 'darwin'
+    ? join(process.resourcesPath, '..', 'Helpers')
+    : join(process.resourcesPath, 'agent-desktop')
+  : join(desktopRoot, 'node_modules', 'agent-desktop', 'bin');
+const executable = process.platform === 'win32' ? '.exe' : '';
+const computerOverlay = createComputerOverlay({
+  onStop: () => {
+    void computerHelper.cancel();
+    void engineRequest('/api/thread/stop', { method: 'POST' }).catch(() => {});
+  },
+  focusSelf: () => showEngine(),
+});
+const computerHelper = createComputerHelper({
+  presence: computerOverlay,
+  binary: join(
+    agentDesktop,
+    app.isPackaged
+      ? `agent-desktop${executable}`
+      : `agent-desktop-${process.platform}-${process.arch}${executable}`,
+  ),
+  helper:
+    process.platform === 'darwin'
+      ? join(
+          agentDesktop,
+          app.isPackaged
+            ? 'agent-desktop-macos-helper'
+            : `agent-desktop-macos-helper-darwin-${process.arch}`,
+        )
+      : undefined,
+  home: join(profileRoot, 'computer-use'),
+  sandboxed: process.platform === 'linux' && Boolean(process.env.FLATPAK_ID),
+  requestPermission: async (which) => {
+    if (which === 'accessibility') systemPreferences.isTrustedAccessibilityClient(true);
+    else
+      await shell.openExternal(
+        'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
+      );
+  },
+});
 const freshLocalProfile = await stat(profileRoot).then(
   () => false,
   (error) => error.code === 'ENOENT',
@@ -1301,6 +1344,15 @@ function openOnePassword(owner) {
   owner.once('exit', () => helper.kill());
 }
 
+async function answerComputer(child, { id, request }) {
+  if (typeof id !== 'string' || !request || typeof request !== 'object') return;
+  const answer = await computerHelper.request(request).then(
+    (result) => ({ result }),
+    (error) => ({ error: error.message }),
+  );
+  if (engine === child) child.postMessage({ type: 'nod-computer-result', id, ...answer });
+}
+
 async function moveToTrash(child, { id, path }) {
   if (typeof id !== 'string' || typeof path !== 'string' || !isAbsolute(path)) return;
   const error = await shell.trashItem(path).then(
@@ -1762,6 +1814,7 @@ function stayAwake(working) {
 }
 
 async function stopEngine() {
+  void computerHelper.cancel().catch(() => {});
   stayAwake(false);
   enginePreferencesReady = false;
   engineRuntimeReady = false;
@@ -2633,6 +2686,7 @@ async function startEngine({ runtime, signal, pending = false }) {
     }
     if (engine === child && message?.type === 'nod-1password-open') openOnePassword(child);
     if (engine === child && message?.type === 'nod-trash') void moveToTrash(child, message);
+    if (engine === child && message?.type === 'nod-computer') void answerComputer(child, message);
     if (
       engine === child &&
       !closingEngine &&

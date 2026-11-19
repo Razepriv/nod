@@ -17,13 +17,13 @@ Nod follows your latest clear message's language, spoken or typed, including que
 
 Type in the message box and press Enter. Press Shift+Enter for a new line.
 
-Pasted text stays literal. Nod uses the clipboard's plain text even when the source also offers formatting. Line breaks, indentation and Markdown-looking characters such as `*priority*`, `# call` and `<u>text</u>` stay as written in the composer, the sent message and Nod's request. The one exception is formatting you add with the toolbar. If plain text in the same paragraph would change it, such as a `!` before a link or a `*` that pairs with italic text, the sent message adds backslashes: before that `!`, or before every `*`, `_`, `~` and backtick in the paragraph's plain text. A web or email address typed directly against formatting is sent as a link, such as `<https://example.com>`. An unsent pasted draft keeps them after a reload.
+Pasted text stays literal by default. Nod uses the clipboard's plain text even when the source also offers formatting. Line breaks, indentation and Markdown-looking characters such as `*priority*`, `# call` and `<u>text</u>` stay as written in the composer, the sent message and Nod's request. If plain text in the same paragraph would change it, such as a `!` before a link or a `*` that pairs with italic text, the sent message adds backslashes: before that `!`, or before every `*`, `_`, `~` and backtick in the paragraph's plain text. A web or email address typed directly against formatting is sent as a link, such as `<https://example.com>`. An unsent pasted draft keeps them after a reload.
 
 Messages can contain up to 100,000 characters. Some emoji and symbols count as two characters toward this limit. If your text is longer, the composer keeps your draft and asks you to shorten it or attach the content as a file.
 
 Web and desktop chat limit text message attempts to 120 per minute and audio message attempts to 120 per minute. If you reach either limit, wait and send again.
 
-Use the formatting toolbar when you want formatted text, including underline and links. It also formats pasted text. Code stays literal, including text that looks like a link or a code fence.
+Use the formatting toolbar to add underline, links, and other formatting to typed or pasted text. To link a selection within one paragraph, paste a single URL beginning with `https://` or `http://`. Code stays literal, including text that looks like a link or a code fence.
 
 - **Attach files.** Select **Attach files**, press Command+U on Mac or Ctrl+U on Windows and Linux while writing a message, paste an image or drop files anywhere in the conversation. Each file stays inside the composer while it uploads. Select it to open the same file viewer used for sent attachments, or retry or remove a failed upload. Each file can be 90 MB or smaller. Nod gets a copy in its [workspace](/use/workspace/). It sees PNG, JPEG and WebP images directly, up to 3.75 MB each and 16 MB per message, unless the model you chose can't read images.
 - **Reply to a message.** Hover over a message and select **Reply**. On touch screens or in a narrow chat, hold or right-click the bubble to open **Reply**, **React** and **Copy**. You can also focus a message and press Shift+F10. Replies show a formatted excerpt in the composer and sent reply. Select it to jump to the original message, then select **Return to where you were** to go back. To see the time inside the bottom-right corner of a bubble, hover over the message, focus one of its controls, or tap its text.
@@ -75,6 +75,8 @@ Under **Free voices**, select **Download** for a one-time download of about 180 
 When a visual makes an answer easier to understand, nod can include images, maps, flight itineraries and comparisons, seat plans, booking summaries, diagrams, or charts.
 
 Each visual appears as a single preview. Hover over it or focus it with the keyboard to reveal its expand control, which stays visible on touch screens. Select that control to inspect it in the file panel. A self-contained card can be the whole answer. Nod adds text for useful context or caveats instead of announcing the card or repeating its contents. Supplied sources and freshness details remain available inside the card. Nod can capture a page it visits and include the screenshot with its answer; select the image to inspect it in the file panel.
+
+When the file panel has more than one file, select the filename at the top to switch files. You can also use the previous and next buttons.
 
 When nod suggests apps to connect, it lists up to three below its message, each with a **Connect** button. Connect starts sign-in right there in the chat, the same as the email step in onboarding. If the app list fails to load, select **Try again** below the message. If catalog access is unavailable, select **Open Apps** to see the available connections. In Telegram and WhatsApp, nod names the apps to connect in [Apps](/connect/apps/) instead.
 
@@ -197,7 +199,7 @@ Nod doesn't ask for passwords or card numbers in chat. It uses a saved login or 
 
 Send `/clear` as a text message without attachments or a recording to start fresh chat context and a clean view. This command works without a model connection on the web, desktop, Telegram and WhatsApp.
 
-Nod stops work in the main chat. Independent tasks keep running. Files, apps, Vault, memory, schedules and settings stay. Previous messages remain available in chat search. The next message starts with fresh model context; automatic related-chat recall also starts at this point.
+Nod stops work in the main chat. Independent tasks keep running, and saved task and schedule instructions stay valid. Files, apps, Vault, memory, schedules and settings stay. Previous messages remain available in chat search. The next message starts with fresh model context; automatic related-chat recall also starts at this point.
 
 Nod has one main chat. `/clear` does not create a second conversation or delete previous messages.
 

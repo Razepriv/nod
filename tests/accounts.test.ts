@@ -22,6 +22,8 @@ import {
   type DecisionConnection,
 } from '../src/providers/decisions.ts';
 import { createMailCheck } from '../src/server/mail-check.ts';
+import { privateEmailResult } from '../src/server/integration-result.ts';
+import { withFailureLog } from '../src/ports/failure-log.ts';
 import type { DecisionQuestion } from '../src/ports/decisions.ts';
 import { createModelTraces } from '../src/server/traces.ts';
 import type { ModelTrace } from '../src/ports/traces.ts';
@@ -38,6 +40,344 @@ import {
   createTextRedactor,
   redactSecretText,
 } from '../src/server/redaction.ts';
+
+test('decision failures retain bounded HTTP and response details', async (t) => {
+  const question: DecisionQuestion = {
+    name: 'access',
+    choices: [
+      { value: false, description: 'Ordinary mail.' },
+      { value: true, description: 'Access secret.' },
+    ],
+  };
+  const canary = 'synthetic-private-value@example.test/private-response';
+  for (const provider of ['openrouter', 'typesafe'] as const)
+    for (const status of [401, 403, 429, 503])
+      await t.test(`${provider} HTTP ${status}`, async () => {
+        const usage: ProviderUsageEvent[] = [];
+        let calls = 0;
+        let cancelled = false;
+        const model = createDecisionModel({
+          resolve: async () => ({ provider, key: canary }),
+          fetch: async () => {
+            calls++;
+            return new Response(
+              new ReadableStream({
+                start(controller) {
+                  controller.enqueue(new TextEncoder().encode(canary));
+                },
+                cancel() {
+                  cancelled = true;
+                  return new Promise(() => {});
+                },
+              }),
+              { status, statusText: canary },
+            );
+          },
+        });
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await assert.rejects(
+            Promise.race([
+              model.check(
+                { instructions: 'Check synthetic mail.', input: {}, question },
+                undefined,
+                (event) => usage.push(event),
+              ),
+              new Promise((_resolve, reject) => {
+                timer = setTimeout(
+                  () => reject(new Error('The HTTP failure waited for its body.')),
+                  500,
+                );
+              }),
+            ]),
+            (error: Error & { code?: string; status?: number }) => {
+              assert.equal(error.code, 'decision_http');
+              assert.equal(error.status, status);
+              assert.equal(error.cause, undefined);
+              assert.ok(!error.message.includes(canary));
+              return true;
+            },
+          );
+        } finally {
+          clearTimeout(timer);
+        }
+        assert.equal(calls, 1);
+        assert.equal(cancelled, true);
+        assert.equal(usage.length, 1);
+        assert.equal(usage[0].status, 'failed');
+      });
+  const cases = [
+    [
+      'transport',
+      'decision_transport',
+      () => {
+        throw Object.assign(new Error(canary), { cause: canary, code: canary });
+      },
+    ],
+    [
+      'response body',
+      'decision_response',
+      () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(new Error(canary));
+            },
+          }),
+          { status: 200 },
+        ),
+    ],
+    ['JSON', 'decision_json', () => new Response(`{"private":"${canary}"`, { status: 200 })],
+    [
+      'missing answer',
+      'decision_validation',
+      () => Response.json({ answers: {}, usage: { input_tokens: 1 } }),
+    ],
+    [
+      'unknown choice',
+      'decision_validation',
+      () =>
+        Response.json({
+          answers: { access: { type: 'choice', choice: canary } },
+          usage: { input_tokens: 1 },
+        }),
+    ],
+    [
+      'invalid probabilities',
+      'decision_validation',
+      () =>
+        Response.json({
+          answers: {
+            access: { type: 'choice', choice: 'false', probabilities: { false: -1, true: 2 } },
+          },
+          usage: { input_tokens: 1 },
+        }),
+    ],
+    [
+      'invalid usage',
+      'decision_validation',
+      () =>
+        Response.json({
+          answers: { access: { type: 'choice', choice: false } },
+          usage: { input_tokens: -1 },
+        }),
+    ],
+  ] as const;
+  for (const [name, code, response] of cases)
+    await t.test(name, async () => {
+      const model = createDecisionModel({
+        resolve: async () => ({ provider: 'openrouter', key: canary }),
+        fetch: async () => response(),
+      });
+      await assert.rejects(
+        model.check({
+          instructions: 'Check synthetic mail.',
+          input: {},
+          question: { ...question, minProbability: 0.99 },
+        }),
+        (error: Error & { code?: string; status?: number; issues?: unknown }) => {
+          assert.equal(error.code, code);
+          assert.equal(error.status, code === 'decision_transport' ? undefined : 200);
+          assert.equal(error.cause, undefined);
+          assert.equal(error.issues, undefined);
+          assert.ok(
+            !JSON.stringify(
+              Object.getOwnPropertyNames(error).map(
+                (key) => (error as unknown as Record<string, unknown>)[key],
+              ),
+            ).includes(canary),
+          );
+          return true;
+        },
+      );
+    });
+  const valid = createDecisionModel({
+    resolve: async () => ({ provider: 'openrouter', key: canary }),
+    fetch: async () =>
+      Response.json({
+        answers: {
+          access: { type: 'choice', choice: 'false', probabilities: { false: 0.999, true: 0.001 } },
+        },
+        usage: { input_tokens: 1 },
+      }),
+  });
+  const accepted = await valid.check({
+    instructions: 'Check synthetic mail.',
+    input: {},
+    question: { ...question, minProbability: 0.99 },
+  });
+  assert.equal(Object(accepted).access, false);
+});
+
+test('mail withholding and failure logs expose only known phases and valid HTTP statuses', async () => {
+  const canary = 'synthetic-private-body-and-provider-value';
+  const failures: Array<Record<string, unknown>> = [];
+  const checks = [
+    ['decision_http', 503, 'request failed (HTTP 503)'],
+    ['decision_response', 200, 'response could not be read (HTTP 200)'],
+    ['decision_json', 200, 'returned invalid JSON (HTTP 200)'],
+    ['decision_validation', 200, 'returned an invalid response (HTTP 200)'],
+    ['decision_transport', undefined, 'connection failed'],
+    [canary, 429, 'request failed (HTTP 429)'],
+    ...[NaN, Infinity, 99, 600, 200.5, '503'].map((status) => [canary, status, 'request failed']),
+  ];
+  for (const [code, status, expected] of checks) {
+    let requests = 0;
+    const check = createMailCheck({
+      curator: {
+        id: 'unused',
+        configured: false,
+        async curate() {
+          assert.fail('No fallback is allowed.');
+        },
+      },
+      decisions: {
+        async check() {
+          requests++;
+          throw Object.assign(new Error(canary), { code, status, cause: canary, issues: [canary] });
+        },
+      },
+    });
+    const result = await withFailureLog(
+      (event, error) => {
+        const value = error as Error & { code?: unknown; status?: unknown; issues?: unknown };
+        assert.equal(value.cause, undefined);
+        assert.equal(value.issues, undefined);
+        failures.push({
+          event,
+          name: value.name,
+          message: value.message,
+          code: value.code,
+          status: value.status,
+        });
+      },
+      () =>
+        privateEmailResult(
+          {
+            messages: [
+              { id: 'synthetic-mail', from: 'sender@example.test', subject: canary, body: canary },
+            ],
+          },
+          check,
+        ),
+    );
+    const encoded = JSON.stringify(result);
+    assert.ok(encoded.includes(String(expected)), encoded);
+    assert.ok(!encoded.includes(canary));
+    assert.equal(requests, 1);
+  }
+  assert.equal(failures.length, checks.length);
+  assert.ok(!JSON.stringify(failures).includes(canary));
+  assert.deepEqual(
+    failures.map((failure) => failure.status),
+    [503, 200, 200, 200, undefined, 429, ...Array(6).fill(undefined)],
+  );
+  assert.ok(failures.every((failure) => failure.event === 'mail_check_failed'));
+});
+
+test('mail checks retain the native curator HTTP status without provider content', async (t) => {
+  const { createServer } = await import('node:http');
+  const { createPiMemoryCurator } = await import('../src/providers/pi/memory-curator.ts');
+  const canary = 'synthetic-private-provider-body';
+  let calls = 0;
+  const server = createServer(async (request, response) => {
+    let text = '';
+    for await (const chunk of request) text += chunk;
+    const body = JSON.parse(text);
+    assert.equal(request.url, '/v1/chat/completions');
+    assert.equal(body.model, 'fixture-mail-check');
+    assert.equal(body.response_format, undefined);
+    calls++;
+    response.writeHead(403, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ error: { message: canary } }));
+  });
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const baseUrl = `http://127.0.0.1:${address.port}/v1`;
+  const curator = createPiMemoryCurator({
+    provider: 'compatible',
+    configured: () => true,
+    resolve: async () => ({
+      provider: 'compatible',
+      method: 'api_key',
+      effort: 'off',
+      definition: {
+        choice: {
+          id: 'fixture-mail-check',
+          name: 'Synthetic mail',
+          images: false,
+          efforts: ['off'],
+          contextWindow: 128000,
+        },
+        spec: {
+          id: 'fixture-mail-check',
+          name: 'Synthetic mail',
+          provider: 'compatible',
+          api: 'openai-completions',
+          baseUrl,
+          reasoning: false,
+          input: ['text'],
+          contextWindow: 128000,
+          maxTokens: 8192,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        },
+      },
+      read: async () => ({ type: 'endpoint', url: baseUrl, key: 'fixture-native-mail-key' }),
+    }),
+  });
+  const failures: unknown[] = [];
+  const result = await withFailureLog(
+    (event, error) => failures.push({ event, ...Object(error) }),
+    () =>
+      privateEmailResult(
+        { from: 'sender@example.test', subject: canary, body: canary },
+        createMailCheck({ curator }),
+      ),
+  );
+  assert.equal(calls, 1);
+  assert.match(JSON.stringify(result), /HTTP 403/);
+  assert.ok(!JSON.stringify(result).includes(canary));
+  assert.deepEqual(failures, [
+    { event: 'mail_check_failed', code: 'mail_check_request', status: 403 },
+  ]);
+});
+
+test('invalid decision settings fail before reserving a budget or sending a request', async () => {
+  let reservations = 0;
+  let requests = 0;
+  const usage: ProviderUsageEvent[] = [];
+  const model = createDecisionModel({
+    resolve: async () => ({ provider: 'openai', key: 'fixture-key', region: 'invalid' as never }),
+    reserve: async () => {
+      reservations++;
+      return async () => {};
+    },
+    fetch: async () => {
+      requests++;
+      assert.fail('An invalid connection must not send a request.');
+    },
+  });
+  await assert.rejects(
+    model.check(
+      {
+        instructions: 'Check synthetic mail.',
+        input: {},
+        question: { name: 'access', choices: [{ value: false, description: 'Ordinary mail.' }] },
+      },
+      undefined,
+      (event) => usage.push(event),
+    ),
+    /Choose an OpenAI API region/,
+  );
+  assert.equal(reservations, 0);
+  assert.equal(requests, 0);
+  assert.equal(usage.length, 0);
+});
 
 test('decision reservations release only requests that did not reach dispatch', async () => {
   for (const phase of ['before dispatch', 'provider error', 'transport error']) {
@@ -173,7 +513,9 @@ test('OpenAI decision failures keep the region and provider reason without expos
       input: {},
       question: { name: 'answer', choices: [{ value: false, description: 'Ask.' }] },
     }),
-    (error: Error) => {
+    (error: Error & { status?: number; code?: string }) => {
+      assert.equal(error.status, 401);
+      assert.equal(error.code, 'decision_http');
       assert.match(error.message, /401/);
       assert.match(error.message, /project geography EU/);
       assert.ok(!error.message.includes(key));
@@ -1114,6 +1456,88 @@ test('retired confirmation replies require high confidence to start a new reques
   }
 });
 
+test('repeated actions require an action-specific decision with high confidence', async () => {
+  let output: unknown;
+  const input = {
+    action: 'CONNECTED_MCP_CALL',
+    args: { tool: 'execute_workflow', input: { workflowId: 'synthetic-workflow' } },
+    reply: 'Set the threshold to 7 and run the synthetic workflow again.',
+    question: 'Which threshold should I use?',
+  };
+  const controller = new AbortController();
+  let receivedSignal: AbortSignal | undefined;
+  const trust = createTrust({
+    pool: {} as never,
+    ownerId: 'synthetic-owner',
+    review: async (instructions, received, signal, question) => {
+      assert.deepEqual(received, input);
+      assert.match(instructions, /never permits execution/);
+      assert.equal(question?.name, 'repeatedAction');
+      assert.deepEqual(
+        question?.choices.map(({ value }) => value),
+        ['new', 'same'],
+      );
+      receivedSignal = signal;
+      return output;
+    },
+  });
+  for (const [answer, expected] of [
+    [{ repeatedAction: 'new', probability: 0.98 }, 'uncertain'],
+    [{ repeatedAction: 'new', probability: '0.995' }, 'uncertain'],
+    [{ repeatedAction: 'new', probability: Number.NaN }, 'uncertain'],
+    [{ repeatedAction: 'new', probability: Number.POSITIVE_INFINITY }, 'uncertain'],
+    [{ repeatedAction: 'new', probability: 1.1 }, 'uncertain'],
+    [{ repeatedAction: 'new' }, 'uncertain'],
+    [{ repeatedAction: 'wrong', probability: 1 }, 'uncertain'],
+    [{ repeatedAction: 'new', probability: 0.995 }, 'new'],
+    [{ repeatedAction: 'same', probability: 0.995 }, 'same'],
+  ] as const) {
+    output = answer;
+    assert.equal(await trust.classifyRepeatedAction(input, controller.signal), expected);
+  }
+  assert.ok(receivedSignal);
+  assert.notEqual(receivedSignal, controller.signal);
+  assert.equal(receivedSignal.aborted, false);
+  controller.abort();
+  assert.equal(receivedSignal.aborted, true);
+});
+
+test('repeated action decisions keep their confidence threshold and refuse a late stopped answer', async () => {
+  const input = {
+    action: 'CONNECTED_MCP_CALL',
+    args: { tool: 'execute_workflow' },
+    reply: 'Run it again.',
+    question: 'Another run?',
+  };
+  const controller = new AbortController();
+  const stopped = createTrust({
+    pool: {} as never,
+    ownerId: 'synthetic-owner',
+    review: async () => {
+      controller.abort(new Error('Synthetic Stop.'));
+      return { repeatedAction: 'new', probability: 1 };
+    },
+  });
+  await assert.rejects(stopped.classifyRepeatedAction(input, controller.signal), /Synthetic Stop/);
+  const decisions = createTrust({
+    pool: {} as never,
+    ownerId: 'synthetic-owner',
+    review: async () => {
+      assert.fail('A selected decision provider must not fall back.');
+    },
+    decisions: {
+      check: async ({ input: received, question }, signal) => {
+        assert.deepEqual(received, input);
+        assert.equal(question.name, 'repeatedAction');
+        assert.equal(question.minProbability, 0.99);
+        assert.ok(signal);
+        return { repeatedAction: 'new', probability: 0.995 };
+      },
+    },
+  });
+  assert.equal(await decisions.classifyRepeatedAction(input), 'new');
+});
+
 test('native decision probabilities validate the wire type and retain refusal and cache costs', async (t) => {
   for (const provider of ['openai', 'typesafe', 'openrouter'] as const)
     await t.test(provider, async () => {
@@ -1861,12 +2285,111 @@ describe('account routes', () => {
     );
   });
 
+  test('conversation trace IDs survive idle gaps and runtime restarts without an analytics ID', async (t) => {
+    const { traceKey } = await import('../src/server/access.ts');
+    const root = await mkdtemp(join(tmpdir(), 'nod-stable-traces-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const delivered: ModelTrace[] = [];
+    const open = async () => {
+      const traces = createModelTraces(async (trace) => {
+        delivered.push(trace);
+      });
+      traces.configure({
+        enabled: true,
+        conversationKey: Buffer.from(await traceKey(root), 'base64url'),
+      });
+      return traces;
+    };
+    const sessionId = randomUUID();
+    const turnId = randomUUID();
+    const trace = (day: number): ModelTrace => ({
+      id: randomUUID(),
+      name: 'fixture-model',
+      provider: 'fixture',
+      startedAt: `2026-11-${day}T10:00:00.000Z`,
+      endedAt: `2026-11-${day}T10:00:01.000Z`,
+      messages: [{ role: 'user', content: 'Synthetic request from lena@example.test.' }],
+      tools: [],
+      output: { role: 'assistant', content: 'Synthetic answer.' },
+      usage: {
+        inputTokens: 10,
+        outputTokens: 2,
+        totalTokens: 12,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costUsd: null,
+      },
+      metadata: {
+        source: 'agent',
+        session_id: sessionId,
+        turn_id: turnId,
+        user_id: 'private-forged-id',
+      },
+    });
+    const settle = async (count: number) => {
+      for (let attempt = 0; attempt < 100 && delivered.length < count; attempt++)
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.equal(delivered.length, count);
+    };
+    const first = await open();
+    assert.equal(first.active(), true);
+    const ids = first.withTurn({ sessionId, turnId }, (ids) => {
+      first.record(trace(19));
+      return ids;
+    });
+    await settle(1);
+    first.record(trace(21));
+    await settle(2);
+    const restarted = await open();
+    const next = restarted.withTurn({ sessionId, turnId: randomUUID() }, (ids) => {
+      restarted.record(trace(23));
+      return ids;
+    });
+    await settle(3);
+    assert.equal(next.thread_id, ids.thread_id);
+    for (const item of delivered) {
+      assert.equal(item.metadata.thread_id, ids.thread_id);
+      assert.equal(item.metadata.user_id, undefined);
+    }
+    const userId = `local:${randomUUID()}`;
+    restarted.configure({ userId });
+    restarted.record(trace(24));
+    await settle(4);
+    assert.equal(delivered[3].metadata.user_id, userId);
+    assert.equal(delivered[3].metadata.thread_id, ids.thread_id);
+    restarted.configure({ userId: undefined });
+    restarted.record(trace(25));
+    await settle(5);
+    assert.equal(delivered[4].metadata.user_id, undefined);
+    assert.equal(delivered[4].metadata.thread_id, ids.thread_id);
+    restarted.configure({ userId: 'invalid' });
+    restarted.record(trace(26));
+    await settle(6);
+    assert.equal(delivered[5].metadata.user_id, undefined);
+    restarted.withTurn({ sessionId: randomUUID(), turnId: randomUUID() }, () =>
+      restarted.record(trace(26)),
+    );
+    await settle(7);
+    assert.notEqual(delivered[6].metadata.thread_id, ids.thread_id);
+    const key = await readFile(join(root, 'trace-key'), 'utf8');
+    if (process.platform !== 'win32')
+      assert.equal((await lstat(join(root, 'trace-key'))).mode & 0o077, 0);
+    for (const privateValue of [sessionId, turnId, key, 'private-forged-id', 'lena@example.test'])
+      assert.ok(
+        !JSON.stringify(delivered).includes(privateValue),
+        privateValue === key ? 'trace key' : privateValue,
+      );
+    restarted.configure({ enabled: false });
+    assert.equal(restarted.active(), false);
+  });
+
   test('conversation traces stay off until the owner opts in, stop at once and leave without personal data', async (t) => {
     const delivered: ModelTrace[] = [];
     const traces = createModelTraces(async (trace) => {
       delivered.push(trace);
     }, '0.3.0');
     traces.configure({
+      userId: `local:${randomUUID()}`,
       secrets: ['fixture-model-key-8c41f2'],
       profile: async () => ({ names: ['Marta Vidal'], region: 'ES' }),
     });
@@ -1936,10 +2459,9 @@ describe('account routes', () => {
     await settle(1);
     assert.equal(delivered.length, 1);
     const sent = JSON.stringify(delivered[0]);
-    const privateContent = [delivered[0].metadata.thread_id, delivered[0].metadata.turn_id].reduce(
-      (text, id) => text.replaceAll(id, '[id]'),
-      sent,
-    );
+    const privateContent = [delivered[0].metadata.thread_id, delivered[0].metadata.turn_id]
+      .map(String)
+      .reduce((text, id) => text.replaceAll(id, '[id]'), sent);
     for (const value of [
       'Marta',
       'Vidal',
@@ -1962,10 +2484,15 @@ describe('account routes', () => {
       assert.ok(!privateContent.includes(value), value);
     assert.match(sent, /order 123456 on 2026-10-19/);
     assert.match(sent, /192\.168\.1\.1\.example/);
-    assert.deepEqual(Object.keys(delivered[0].metadata), ['turn_id', 'thread_id', 'app_version']);
+    assert.deepEqual(Object.keys(delivered[0].metadata), [
+      'turn_id',
+      'thread_id',
+      'user_id',
+      'app_version',
+    ]);
     assert.equal(delivered[0].metadata.app_version, '0.3.0');
-    assert.match(delivered[0].metadata.thread_id, /^[0-9a-f]{32}$/);
-    assert.match(delivered[0].metadata.turn_id, /^[0-9a-f]{32}$/);
+    assert.match(String(delivered[0].metadata.thread_id), /^[0-9a-f]{32}$/);
+    assert.match(String(delivered[0].metadata.turn_id), /^[0-9a-f]{32}$/);
     assert.ok(!sent.includes('fixture-session') && !sent.toLowerCase().includes(turnId));
     assert.ok(sent.includes(`task ${delivered[0].metadata.turn_id}`));
     assert.ok(!sent.includes(homedir()) && sent.includes('~/Library/nod.json'));
@@ -1974,7 +2501,7 @@ describe('account routes', () => {
     traces.record(trace('A request after a long pause', 57));
     await settle(3);
     assert.equal(delivered[1].metadata.thread_id, delivered[0].metadata.thread_id);
-    assert.notEqual(delivered[2].metadata.thread_id, delivered[1].metadata.thread_id);
+    assert.equal(delivered[2].metadata.thread_id, delivered[1].metadata.thread_id);
     await request({ traces: false });
     traces.record(trace('After opting out'));
     await settle(4);
@@ -3084,6 +3611,35 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     assert.ok(Math.abs(small.input - 0.00001) < 1e-12);
     assert.ok(Math.abs(small.output - 0.00002) < 1e-12);
     assert.ok(models.every((model) => !('spec' in model)));
+    const tier = { inputTokensAbove: 100_000, input: 3, output: 6, cacheRead: 1, cacheWrite: 3 };
+    await f.database.query(
+      `UPDATE model_connections SET models=jsonb_set(
+        jsonb_set(models,'{0,spec,cost,tiers}',$3),'{1,spec,cost,tiers}',$4
+      ) WHERE id=$1 AND owner_id=$2`,
+      [
+        id,
+        ownerId,
+        JSON.stringify([tier]),
+        JSON.stringify([
+          tier,
+          {
+            ...tier,
+            inputTokensAbove: 120_000,
+            cacheWrite: -1,
+          },
+        ]),
+      ],
+    );
+    const tiered = await f.create(ownerId, backend);
+    const [paidTier, variableTier] = tiered.view().connections[0].models;
+    assert.deepEqual(paidTier.pricing, {
+      input: 1.25,
+      output: 5,
+      cacheRead: 0,
+      cacheWrite: 0,
+      tiers: [tier],
+    });
+    assert.equal(variableTier.pricing, 'variable');
     await f.database.query(
       `UPDATE model_connections SET models=jsonb_set(models,'{0,spec,cost,input}','"invalid"') WHERE id=$1 AND owner_id=$2`,
       [id, ownerId],
@@ -3521,15 +4077,48 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     await fallback.addKey('deepseek', 'fixture-fallback-key');
     assert.equal(fallback.view().selection?.modelId, 'fixture-small');
     assert.equal(fallback.view().selection?.effort, 'off');
-    const subscription = await f.create('fixture-subscription-default', {
-      ...backend,
+    const { createPiModelBackend } = await import('../src/providers/pi/models.ts');
+    let offered = ['gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol'];
+    const openaiBackend = {
+      ...createPiModelBackend({
+        fetch: async () =>
+          Response.json({
+            data: offered.map((id) => ({ id })),
+            models: offered.map((slug) => ({ slug, visibility: 'list' })),
+          }),
+      }),
       signIn: stubSignIn(async () => subscriptionCredential()),
-    });
-    const signIn = await subscription.start('openai');
-    await subscription.complete(
-      new URL(`http://127.0.0.1:1455/auth/callback?state=${signIn.attempt}&code=fixture`),
-    );
-    assert.equal(subscription.view().selection?.modelId, 'gpt-6-sol');
+    };
+    for (const method of ['api_key', 'subscription'] as const) {
+      const connect = async (owner: Awaited<ReturnType<typeof f.create>>) => {
+        if (method === 'api_key') await owner.addKey('openai', 'fixture-openai-default-key');
+        else {
+          const signIn = await owner.start('openai');
+          await owner.complete(
+            new URL(`http://127.0.0.1:1455/auth/callback?state=${signIn.attempt}&code=fixture`),
+          );
+        }
+      };
+      offered = ['gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol'];
+      const ownerId = `fixture-openai-default-${method}`;
+      const openai = await f.create(ownerId, openaiBackend);
+      await connect(openai);
+      assert.equal(openai.view().selection?.modelId, 'gpt-6.2-sol');
+      assert.equal(openai.view().selection?.effort, 'high');
+      const selected = { ...openai.view().selection!, modelId: 'gpt-6.1-sol' };
+      await openai.select(selected);
+      await openai.refreshCatalog(selected.connectionId);
+      assert.deepEqual(openai.view().selection, selected);
+      const restarted = await f.create(ownerId, openaiBackend);
+      assert.deepEqual(restarted.view().selection, selected);
+      offered = ['gpt-6-sol', 'gpt-6.1-sol'];
+      const legacy = await f.create(`${ownerId}-legacy`, openaiBackend);
+      await connect(legacy);
+      assert.equal(
+        legacy.view().selection?.modelId,
+        method === 'subscription' ? 'gpt-6-sol' : 'gpt-6.1-sol',
+      );
+    }
     const count = google.view().connections.length;
     for (const settings of [
       {},
@@ -4669,6 +5258,10 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     );
     const access = await owner.resolve();
     assert.equal(access.definition.spec.baseUrl, `${address}/v1`);
+    const endpointPrice = owner.priceOf(owner.view().selection);
+    assert.ok(endpointPrice);
+    assert.equal(endpointPrice.modelId, 'fixture-local');
+    assert.equal(endpointPrice.pricing, undefined);
     assert.equal(owner.hasApiKey('openai'), false);
     assert.equal(await owner.apiKey('openai'), undefined);
     assert.deepEqual(await access.read(), {

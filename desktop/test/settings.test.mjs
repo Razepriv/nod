@@ -43,6 +43,7 @@ import {
 import { createDesktopAnalytics } from '../main/analytics.mjs';
 import { createAppPreferencesStore } from '../main/app-preferences.mjs';
 import { createChatReadCursorStore } from '../main/chat-read-cursors.mjs';
+import { createComputerHelper } from '../main/computer-helper.mjs';
 import { createReadinessNotice, createUnreadBadge, isQuietTime } from '../main/notifications.mjs';
 import { saveArtifactDownload } from '../main/downloads.mjs';
 import { createArtifactFiles } from '../main/artifact-files.mjs';
@@ -723,6 +724,8 @@ async function runningDesktop(
       }),
     }),
     createChatReadCursorStore,
+    createComputerHelper: () => ({ request: async () => ({}), cancel: async () => {} }),
+    createComputerOverlay: () => ({}),
     createArtifactFiles: createFiles,
     saveArtifactDownload,
     createReadinessNotice,
@@ -1876,6 +1879,23 @@ test('local selection shows startup progress and hands off to app onboarding bef
         continued: true,
       });
       await settle(() => calls.length === (scenario === 'retry' ? 3 : 2));
+      if (scenario === 'waiting') {
+        runtime.resolve({ phase: 'preparing', engineReady: true, runtime: { phase: 'preparing' } });
+        await new Promise((accept) => setTimeout(accept, 20));
+        publish({
+          phase: 'starting',
+          engineReady: false,
+          runtime: { phase: 'preparing', stage: 'workspace' },
+        });
+        await new Promise((accept) => setTimeout(accept, 20));
+        publish({
+          phase: 'preparing',
+          engineReady: true,
+          runtime: { phase: 'preparing', stage: 'workspace' },
+        });
+        await new Promise((accept) => setTimeout(accept, 50));
+        assert.equal(choices.length, 2, 'A restarted engine must not submit Welcome again.');
+      }
       assert.equal(emailRendered, false);
       runtime.resolve({ phase: 'ready', engineReady: true, runtime: { phase: 'ready' } });
       await new Promise((accept) => setTimeout(accept, 20));
@@ -9227,6 +9247,693 @@ test('legacy account completion migrates to device progress without changing key
   assert.equal(Object.hasOwn(migrated, 'onboardingCompleted'), false);
   assert.deepEqual(migrated.secrets, value.secrets);
   assert.deepEqual(await f.reopen().environment(), environment);
+});
+
+async function fakeDesktop(t, answers, options = {}) {
+  const root = await mkdtemp(join(tmpdir(), 'nod-desktop-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const log = join(root, 'log.jsonl');
+  const binary = join(root, 'agent-desktop');
+  await writeFile(
+    binary,
+    `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const input = fs.readFileSync(0, 'utf8');
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args, input }) + '\\n');
+const answers = ${JSON.stringify(answers)};
+const key = Object.keys(answers).find((prefix) => args.join(' ').startsWith(prefix));
+let answer = key ? answers[key] : { ok: true, data: args[0] === 'snapshot' ? { complete: true, tree: { role: 'window', name: 'Mail' } } : {} };
+if (Array.isArray(answer)) {
+  const counter = ${JSON.stringify(log)} + '.' + key.replaceAll(' ', '_');
+  const seen = fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) : 0;
+  fs.writeFileSync(counter, String(seen + 1));
+  answer = answer[Math.min(seen, answer.length - 1)];
+}
+process.stdout.write(JSON.stringify(answer));
+`,
+    { mode: 0o755 },
+  );
+  const events = [];
+  let clipboard = 'owner copied this';
+  const presence = {
+    ownPid: -1,
+    idle: [5],
+    idleSeconds: () => (presence.idle.length > 1 ? presence.idle.shift() : presence.idle[0]),
+    show: (state) =>
+      events.push(state.background ? 'background' : state.waiting ? 'waiting' : 'shown'),
+    hide: () => events.push('hidden'),
+    focusSelf: () => events.push('focus Nod'),
+    clipboard: {
+      save: () => clipboard,
+      write: (text) => {
+        clipboard = text;
+      },
+      restore: (saved) => {
+        clipboard = saved;
+      },
+    },
+  };
+  const helper = createComputerHelper({
+    binary,
+    home: join(root, 'home'),
+    requestPermission: async () => {},
+    presence,
+    ownerWaitMs: 300,
+    lingerMs: 20,
+    backgroundLingerMs: 20,
+    platform: 'darwin',
+    ...options,
+  });
+  return {
+    helper,
+    presence,
+    events,
+    clipboard: () => clipboard,
+    calls: async () =>
+      (await readFile(log, 'utf8').catch(() => ''))
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line).args.join(' '))
+        .filter((call) => !call.startsWith('list-windows')),
+  };
+}
+
+const mailWindow = {
+  ok: true,
+  data: [
+    {
+      id: 'w-1',
+      pid: process.pid,
+      app_name: 'Mail',
+      is_focused: true,
+      bounds: { x: 10, y: 10, width: 400, height: 300 },
+    },
+  ],
+};
+const refused = (code, message) => ({ ok: false, error: { code, message } });
+
+test('computer use binds current window content and hides password content', async (t) => {
+  const window = (value, ref, focused = false) => ({
+    ok: true,
+    data: {
+      complete: true,
+      tree: {
+        role: 'window',
+        name: 'Message',
+        children: [
+          { role: 'textfield', name: 'To', value, ref_id: ref, states: focused ? ['focused'] : [] },
+          {
+            role: 'textfield',
+            name: 'private password label',
+            value: 'private password value',
+            states: ['secure'],
+            children: [{ role: 'text', name: 'private password child', states: ['focused'] }],
+          },
+        ],
+      },
+    },
+  });
+  const withButton = (...children) => {
+    const read = window('bo@example.test', '@sfourth1:e2');
+    read.data.tree.children.push({ role: 'button', name: 'Full Screen', children });
+    return read;
+  };
+  const desktop = await fakeDesktop(t, {
+    snapshot: [
+      window('ana@example.test', '@sfirst01:e1'),
+      window('ana@example.test', '@ssecond1:e8', true),
+      window('bo@example.test', '@sthird01:e2'),
+      withButton({ role: 'group', children: [{ role: 'group' }] }),
+      withButton(),
+      { ok: true, data: { complete: false, tree: { role: 'window' } } },
+      { ok: true, data: { complete: true, tree: { role: 'window', children_count: 1 } } },
+    ],
+  });
+  const inspect = () => desktop.helper.request({ op: 'inspect', app: 'Mail', window: 'w-1' });
+  const first = await inspect();
+  const second = await inspect();
+  const third = await inspect();
+  assert.equal(first.state, second.state);
+  assert.notEqual(first.focus, second.focus);
+  assert.notEqual(first.state, third.state);
+  const fourth = await inspect();
+  assert.equal(
+    fourth.state,
+    (await desktop.helper.request({ op: 'inspect', app: 'Mail', window: 'w-1' })).state,
+  );
+  assert.doesNotMatch(JSON.stringify(first), /private password/);
+  await assert.rejects(inspect(), /complete window/);
+  await assert.rejects(inspect(), /Part of the window is missing/);
+});
+
+test('computer use binds a long list only by the rows the step needs', async (t) => {
+  const inbox = (subjects, selected, button = 'New Message') => ({
+    ok: true,
+    data: {
+      complete: true,
+      tree: {
+        role: 'window',
+        name: 'Inbox',
+        children: [
+          { role: 'toolbar', children: [{ role: 'button', name: button }] },
+          {
+            role: 'table',
+            children: subjects.map((name) => ({
+              role: 'row',
+              name,
+              states: name === selected ? ['selected'] : [],
+            })),
+          },
+        ],
+      },
+    },
+  });
+  const rows = (count) => Array.from({ length: count }, (_, index) => `Message ${index}`);
+  const desktop = await fakeDesktop(t, {
+    snapshot: [
+      inbox(rows(500), 'Message 7'),
+      inbox(['Just arrived', ...rows(500)], 'Message 7'),
+      inbox(rows(500), 'Message 8'),
+      inbox(rows(500), 'Message 7', 'Archive'),
+      {
+        ok: true,
+        data: {
+          complete: true,
+          tree: {
+            role: 'window',
+            name: 'New Message',
+            children: [
+              { role: 'button', name: 'New Message' },
+              ...rows(25).map((name) => ({ role: 'textfield', name, value: `${name} value` })),
+            ],
+          },
+        },
+      },
+    ],
+  });
+  const inspect = () =>
+    desktop.helper.request({
+      op: 'inspect',
+      app: 'Mail',
+      window: 'w-1',
+      control: { role: 'button', name: 'New Message' },
+    });
+  const first = await inspect();
+  const arrived = await inspect();
+  const moved = await inspect();
+  assert.equal(first.incomplete, true);
+  assert.match(JSON.stringify(first.tree), /New Message.*Message 7/);
+  assert.doesNotMatch(JSON.stringify(first.tree), /Message 8|Message 499/);
+  assert.equal(first.state, arrived.state);
+  assert.notEqual(first.state, moved.state);
+  await assert.rejects(inspect(), /no longer in the window/);
+  const compose = await inspect();
+  assert.equal(compose.incomplete, false);
+  assert.match(JSON.stringify(compose.tree), /Message 24 value/);
+});
+
+test('computer use can create a first document without exposing the Apple or app menu', async (t) => {
+  const desktop = await fakeDesktop(t, {
+    'snapshot --root': {
+      ok: true,
+      data: { complete: true, tree: { role: 'menuitem', name: 'New' } },
+    },
+    snapshot: {
+      ok: true,
+      data: {
+        complete: true,
+        tree: {
+          role: 'menu',
+          children: [
+            { role: 'menuitem', name: 'Apple', children: [{ role: 'menuitem', name: 'Restart' }] },
+            {
+              role: 'menuitem',
+              name: 'TextEdit',
+              children: [{ role: 'menuitem', name: 'Services' }],
+            },
+            { role: 'menuitem', name: 'File', children: [{ role: 'menuitem', name: 'New' }] },
+          ],
+        },
+      },
+    },
+  });
+  const inspected = await desktop.helper.request({ op: 'inspect', app: 'TextEdit', menu: true });
+  assert.doesNotMatch(JSON.stringify(inspected), /Apple|Restart|Services/);
+  await desktop.helper.request({
+    op: 'press',
+    app: 'TextEdit',
+    menu: true,
+    ref: '@sfirst01:e1',
+    expected: inspected.state,
+    control: { role: 'menuitem', name: 'New' },
+  });
+  assert.ok((await desktop.calls()).includes('click @sfirst01:e1'));
+});
+
+test('computer use checks the window again after waiting for the owner', async (t) => {
+  const tree = (value) => ({
+    role: 'window',
+    name: 'Mail',
+    children: [{ role: 'textfield', name: 'To', value }],
+  });
+  const desktop = await fakeDesktop(
+    t,
+    {
+      'list-windows': mailWindow,
+      snapshot: [
+        { ok: true, data: { complete: true, tree: tree('ana@example.test') } },
+        { ok: true, data: { complete: true, tree: tree('bo@example.test') } },
+      ],
+    },
+    { platform: 'win32' },
+  );
+  const inspected = await desktop.helper.request({ op: 'inspect', app: 'Mail', window: 'w-1' });
+  desktop.presence.idle = [0, 5];
+  await assert.rejects(
+    desktop.helper.request({
+      op: 'key',
+      keys: 'ctrl+enter',
+      app: 'Mail',
+      window: 'w-1',
+      expected: inspected.state,
+    }),
+    /STALE_REF: That window changed/,
+  );
+  assert.ok(desktop.events.includes('waiting'));
+  assert.ok(!(await desktop.calls()).some((call) => call.startsWith('press ')));
+});
+
+test('computer use refuses a password focus or renamed control at delivery', async (t) => {
+  const secured = (focused) => ({
+    role: 'window',
+    children: [{ role: 'textfield', states: focused ? ['secure', 'focused'] : ['secure'] }],
+  });
+  const desktop = await fakeDesktop(
+    t,
+    {
+      'list-windows': mailWindow,
+      'snapshot --root': {
+        ok: true,
+        data: { complete: true, tree: { role: 'button', name: 'Delete' } },
+      },
+      snapshot: [
+        { ok: true, data: { complete: true, tree: secured(false) } },
+        { ok: true, data: { complete: true, tree: secured(true) } },
+      ],
+    },
+    { platform: 'win32' },
+  );
+  const inspected = await desktop.helper.request({ op: 'inspect', app: 'Mail', window: 'w-1' });
+  await assert.rejects(
+    desktop.helper.request({
+      op: 'key',
+      keys: 'x',
+      app: 'Mail',
+      window: 'w-1',
+      expected: inspected.state,
+      noSecureFocus: true,
+    }),
+    /password field has focus/,
+  );
+  await assert.rejects(
+    desktop.helper.request({
+      op: 'press',
+      ref: '@sfirst01:e1',
+      app: 'Mail',
+      window: 'w-1',
+      control: { role: 'button', name: 'Send' },
+    }),
+    /STALE_REF: That control changed/,
+  );
+  assert.ok(!(await desktop.calls()).some((call) => /^(press|click) /.test(call)));
+});
+
+test('computer use refuses a changed keyboard target even when window content stays the same', async (t) => {
+  const tree = (selected) => ({
+    role: 'window',
+    children: ['First', 'Second'].map((name, index) => ({
+      role: 'textfield',
+      name,
+      value: '',
+      states: index === selected ? ['focused'] : [],
+    })),
+  });
+  const desktop = await fakeDesktop(
+    t,
+    {
+      'list-windows': mailWindow,
+      snapshot: [
+        { ok: true, data: { complete: true, tree: tree(0) } },
+        { ok: true, data: { complete: true, tree: tree(1) } },
+      ],
+    },
+    { platform: 'win32' },
+  );
+  const inspected = await desktop.helper.request({
+    op: 'inspect',
+    app: 'Mail',
+    window: 'w-1',
+    focus: true,
+  });
+  await assert.rejects(
+    desktop.helper.request({
+      op: 'key',
+      keys: 'enter',
+      app: 'Mail',
+      window: 'w-1',
+      expected: inspected.state,
+      expectedFocus: inspected.focus,
+    }),
+    /keyboard target changed/,
+  );
+  assert.ok(!(await desktop.calls()).some((call) => call.startsWith('press ')));
+});
+
+test('computer use takes focus only after a refusal before delivery, and only while the owner pauses', async (t) => {
+  const desktop = await fakeDesktop(t, {
+    'list-windows': mailWindow,
+    'press cmd+n --app Mail --window-id w-1 --headed': { ok: true, data: {} },
+    'press cmd+n': refused(
+      'STALE_REF',
+      "The named window's exact focus could not be confirmed, so no key was sent",
+    ),
+    'click @s1abcdef:e1': refused(
+      'ACTION_FAILED',
+      'AXPress did not establish a verifiable effect; mutation outcome is uncertain',
+    ),
+  });
+  const key = { op: 'key', keys: 'cmd+n', app: 'Mail', window: 'w-1' };
+  desktop.presence.idle = [0, 0, 5];
+  await desktop.helper.request(key);
+  assert.deepEqual(await desktop.calls(), [
+    'press cmd+n --app Mail --window-id w-1',
+    'focus-window --app Mail --window-id w-1',
+    'press cmd+n --app Mail --window-id w-1 --headed',
+  ]);
+  assert.deepEqual(desktop.events.slice(0, 3), ['background', 'waiting', 'shown']);
+  await waitFor(() => assert.ok(desktop.events.includes('hidden')), { interval: 10 });
+
+  await assert.rejects(
+    desktop.helper.request({
+      op: 'press',
+      ref: '@s1abcdef:e1',
+      app: 'Mail',
+      window: 'w-1',
+      role: 'button',
+    }),
+    /ACTION_FAILED/,
+  );
+  assert.equal((await desktop.calls()).filter((call) => call.startsWith('click')).length, 1);
+
+  desktop.presence.idle = [0];
+  const before = (await desktop.calls()).length;
+  await assert.rejects(desktop.helper.request(key), /OWNER_ACTIVE/);
+  assert.deepEqual((await desktop.calls()).slice(before), [
+    'press cmd+n --app Mail --window-id w-1',
+  ]);
+});
+
+test('computer use Stop for all work still gives focus back to the owner window', async (t) => {
+  const notes = {
+    id: 'w-2',
+    pid: process.pid,
+    app_name: 'TextEdit',
+    is_focused: true,
+    bounds: { x: 0, y: 0, width: 300, height: 200 },
+  };
+  const mail = { ...mailWindow.data[0], is_focused: false };
+  const desktop = await fakeDesktop(t, {
+    'list-windows --app': mailWindow,
+    'list-windows': [
+      { ok: true, data: [notes, mail] },
+      {
+        ok: true,
+        data: [
+          { ...notes, is_focused: false },
+          { ...mail, is_focused: true },
+        ],
+      },
+    ],
+    'press cmd+n': refused('STALE_REF', "The named window's exact focus could not be confirmed"),
+  });
+  const show = desktop.presence.show;
+  desktop.presence.show = (state) => {
+    show(state);
+    if (!state.background && !state.waiting) void desktop.helper.cancel();
+  };
+  await assert.rejects(
+    desktop.helper.request({ op: 'key', keys: 'cmd+n', app: 'Mail', window: 'w-1' }),
+    /STOPPED/,
+  );
+  const calls = await desktop.calls();
+  assert.ok(calls.includes('focus-window --app TextEdit --window-id w-2'), calls.join('\n'));
+  assert.ok(!calls.includes('press cmd+n --app Mail --window-id w-1 --headed'));
+});
+
+test('computer use Stop for all work refuses later commands of a step already running', async (t) => {
+  const desktop = await fakeDesktop(t, { 'list-windows': mailWindow });
+  const show = desktop.presence.show;
+  desktop.presence.show = (state) => {
+    show(state);
+    void desktop.helper.cancel();
+  };
+  await assert.rejects(
+    desktop.helper.request({ op: 'key', keys: 'cmd+n', app: 'Mail', window: 'w-1' }),
+    /STOPPED/,
+  );
+  assert.deepEqual(await desktop.calls(), []);
+});
+
+test('computer use Stop ends only its own step, and no step starts after its deadline', async (t) => {
+  const desktop = await fakeDesktop(t, {
+    'list-windows': mailWindow,
+    'press cmd+n --app Mail --window-id w-1 --headed': { ok: true, data: {} },
+    'press cmd+n': refused('STALE_REF', "The named window's exact focus could not be confirmed"),
+  });
+  desktop.presence.idle = [0];
+  const pending = desktop.helper.request({
+    op: 'key',
+    keys: 'cmd+n',
+    app: 'Mail',
+    window: 'w-1',
+    step: 'mine',
+  });
+  await waitFor(() => assert.ok(desktop.events.includes('waiting')), { interval: 10 });
+  await desktop.helper.request({ op: 'cancel', step: 'another' });
+  const settled = await Promise.race([
+    pending.then(
+      () => 'done',
+      () => 'failed',
+    ),
+    new Promise((resolve) => setTimeout(() => resolve('waiting'), 100)),
+  ]);
+  assert.equal(settled, 'waiting');
+  await desktop.helper.request({ op: 'cancel', step: 'mine' });
+  await assert.rejects(pending, /STOPPED/);
+  assert.deepEqual(await desktop.calls(), ['press cmd+n --app Mail --window-id w-1']);
+  assert.equal(desktop.events.at(-1), 'hidden');
+
+  await assert.rejects(
+    desktop.helper.request({
+      op: 'press',
+      ref: '@s1abcdef:e1',
+      app: 'Mail',
+      window: 'w-1',
+      role: 'button',
+      deadline: Date.now() - 1,
+    }),
+    /STOPPED/,
+  );
+  assert.deepEqual(await desktop.calls(), ['press cmd+n --app Mail --window-id w-1']);
+});
+
+test('computer use pastes into a message body in front and restores the owner clipboard', async (t) => {
+  const desktop = await fakeDesktop(t, { 'list-windows': mailWindow });
+  await desktop.helper.request({
+    op: 'type',
+    ref: '@s1abcdef:e1',
+    app: 'Mail',
+    window: 'w-1',
+    role: 'scrollarea',
+    text: 'Hi Toni',
+  });
+  assert.deepEqual(await desktop.calls(), [
+    'focus-window --app Mail --window-id w-1',
+    'focus @s1abcdef:e1',
+    'snapshot --app Mail --window-id w-1 --max-depth 50',
+    'press cmd+v --app Mail --window-id w-1 --headed',
+  ]);
+  assert.equal(desktop.clipboard(), 'owner copied this');
+});
+
+test('computer use shows Nod working in an app during background steps, then hides it', async (t) => {
+  const desktop = await fakeDesktop(t, { 'list-windows': mailWindow });
+  await desktop.helper.request({
+    op: 'press',
+    ref: '@s1abcdef:e1',
+    app: 'Mail',
+    window: 'w-1',
+    role: 'button',
+  });
+  assert.deepEqual(await desktop.calls(), ['click @s1abcdef:e1']);
+  assert.deepEqual(desktop.events, ['background']);
+  await waitFor(() => assert.ok(desktop.events.includes('hidden')), { interval: 10 });
+});
+
+test('computer use pastes with ctrl+v on Linux and Windows, and types from the front on Windows', async (t) => {
+  const linux = await fakeDesktop(t, { 'list-windows': mailWindow }, { platform: 'linux' });
+  await linux.helper.request({
+    op: 'type',
+    ref: '@s1abcdef:e1',
+    app: 'Mail',
+    window: 'w-1',
+    role: 'document',
+    text: 'Hi Toni',
+  });
+  assert.equal((await linux.calls()).at(-1), 'press ctrl+v --app Mail --window-id w-1 --headed');
+
+  const windows = await fakeDesktop(t, { 'list-windows': mailWindow }, { platform: 'win32' });
+  await windows.helper.request({
+    op: 'type',
+    ref: '@s1abcdef:e1',
+    app: 'Mail',
+    window: 'w-1',
+    role: 'textfield',
+    text: 'Hi',
+  });
+  assert.deepEqual(await windows.calls(), [
+    'focus-window --app Mail --window-id w-1',
+    'type @s1abcdef:e1 --stdin --headed',
+  ]);
+});
+
+test('computer use on Linux opens only installed desktop apps that do not run in a terminal', async (t) => {
+  const data = await mkdtemp(join(tmpdir(), 'nod-desktop-entries-'));
+  t.after(() => rm(data, { recursive: true, force: true }));
+  await mkdir(join(data, 'applications'));
+  await writeFile(
+    join(data, 'applications', 'org.gnome.TextEditor.desktop'),
+    '[Desktop Entry]\nType=Application\nName=Text Editor\nExec=gnome-text-editor\n',
+  );
+  await writeFile(
+    join(data, 'applications', 'debian-xterm.desktop'),
+    '[Desktop Entry]\nType=Application\nName=XTerm\nExec=xterm\nCategories=System;TerminalEmulator;\n',
+  );
+  await writeFile(
+    join(data, 'applications', 'org.gnome.Settings.desktop'),
+    '[Desktop Entry]\nType=Application\nName=Settings\nExec=gnome-control-center\nCategories=GTK;Settings;\n',
+  );
+  await writeFile(
+    join(data, 'applications', 'org.gnome.Terminal.desktop'),
+    '[Desktop Entry]\nType=Application\nName=Terminal\nExec=gnome-terminal\nTerminal=true\n',
+  );
+  const saved = { home: process.env.XDG_DATA_HOME, dirs: process.env.XDG_DATA_DIRS };
+  process.env.XDG_DATA_HOME = data;
+  process.env.XDG_DATA_DIRS = join(data, 'none');
+  t.after(() => {
+    for (const [name, value] of [
+      ['XDG_DATA_HOME', saved.home],
+      ['XDG_DATA_DIRS', saved.dirs],
+    ])
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+  });
+  const desktop = await fakeDesktop(
+    t,
+    { status: { ok: true, data: { supported_surfaces: ['window', 'menu'] } } },
+    { platform: 'linux' },
+  );
+  assert.deepEqual(await desktop.helper.request({ op: 'locate', bundle: 'org.gnome.TextEditor' }), {
+    bundle: 'org.gnome.TextEditor',
+    name: 'Text Editor',
+    program: 'gnome-text-editor',
+  });
+  await assert.rejects(
+    desktop.helper.request({ op: 'open', bundle: 'debian-xterm' }),
+    /runs in a terminal/,
+  );
+  await assert.rejects(
+    desktop.helper.request({ op: 'open', bundle: 'org.gnome.Settings' }),
+    /system, settings or file manager/,
+  );
+  await assert.rejects(
+    desktop.helper.request({ op: 'open', bundle: 'org.gnome.Terminal' }),
+    /runs in a terminal/,
+  );
+  await assert.rejects(
+    desktop.helper.request({ op: 'open', bundle: 'bash' }),
+    /No app with the desktop ID/,
+  );
+  assert.deepEqual(await desktop.calls(), []);
+  await assert.rejects(
+    desktop.helper.request({ op: 'snapshot', app: 'gedit', menu: true }),
+    /ACTION_NOT_SUPPORTED: This computer has no separate menu bar/,
+  );
+
+  const flatpak = await fakeDesktop(t, {}, { platform: 'linux', sandboxed: true });
+  await assert.rejects(
+    flatpak.helper.request({ op: 'open', bundle: 'org.gnome.TextEditor' }),
+    /Flatpak sandbox/,
+  );
+});
+
+test('computer use on Windows starts only windowed programs', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'nod-windows-root-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'System32'));
+  const program = (subsystem) => {
+    const header = Buffer.alloc(256);
+    header.write('MZ', 0, 'latin1');
+    header.writeUInt32LE(0x80, 0x3c);
+    header.write('PE\0\0', 0x80, 'latin1');
+    header.writeUInt16LE(subsystem, 0x80 + 0x5c);
+    return header;
+  };
+  await writeFile(join(root, 'System32', 'notepad.exe'), program(2));
+  await writeFile(join(root, 'System32', 'logoff.exe'), program(3));
+  const saved = process.env.SystemRoot;
+  process.env.SystemRoot = root;
+  t.after(() => {
+    if (saved === undefined) delete process.env.SystemRoot;
+    else process.env.SystemRoot = saved;
+  });
+  const desktop = await fakeDesktop(
+    t,
+    { launch: { ok: true, data: { pid: 9 } } },
+    { platform: 'win32' },
+  );
+  assert.deepEqual(await desktop.helper.request({ op: 'locate', bundle: 'notepad' }), {
+    bundle: 'notepad.exe',
+    name: 'notepad',
+    program: 'notepad.exe',
+  });
+  await assert.rejects(
+    desktop.helper.request({ op: 'open', bundle: 'logoff' }),
+    /not a windowed app/,
+  );
+  assert.deepEqual(await desktop.helper.request({ op: 'open', bundle: 'notepad' }), { pid: 9 });
+  assert.deepEqual(await desktop.calls(), [`launch ${join(root, 'System32', 'notepad.exe')}`]);
+});
+
+test('computer use keeps no focus session when the window cannot come to the front', async (t) => {
+  const desktop = await fakeDesktop(t, {
+    'list-windows': mailWindow,
+    'focus-window': refused('ACTION_NOT_SUPPORTED', 'focus-window is unavailable in this session'),
+    'press cmd+n': refused('STALE_REF', "The named window's exact focus could not be confirmed"),
+  });
+  const key = { op: 'key', keys: 'cmd+n', app: 'Mail', window: 'w-1' };
+  await assert.rejects(desktop.helper.request(key), /ACTION_NOT_SUPPORTED/);
+  assert.equal(desktop.events.at(-1), 'hidden');
+  await assert.rejects(desktop.helper.request(key), /ACTION_NOT_SUPPORTED/);
+  assert.deepEqual(
+    (await desktop.calls()).filter((call) => call.startsWith('focus-window')),
+    ['focus-window --app Mail --window-id w-1', 'focus-window --app Mail --window-id w-1'],
+  );
+  assert.equal(
+    (await desktop.calls()).some((call) => call.includes('--headed')),
+    false,
+  );
 });
 
 async function updateDownloadFixture(t) {

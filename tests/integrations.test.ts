@@ -9388,6 +9388,143 @@ test(
 );
 
 test(
+  'renames a custom MCP server for the owner without changing its saved connection',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    const schema = `test_mcp_name_${randomUUID().replaceAll('-', '')}`;
+    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const pool = new pg.Pool({
+      connectionString: process.env.TEST_DATABASE_URL,
+      options: `-c search_path=${schema}`,
+    });
+    const app = Fastify();
+    const foreign = Fastify();
+    t.after(async () => {
+      await app.close();
+      await foreign.close();
+      await pool.end();
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    });
+    const ownerId = 'fixture-mcp-owner';
+    const key = randomBytes(32);
+    const keyStore = { id: 'fixture', configured: true, getKey: async () => key };
+    const unused = async () => {
+      throw new Error('Renaming must not call the MCP server or its authorization service.');
+    };
+    const transport = {
+      ...createDiscoveredTransport(unused),
+      listTools: t.mock.fn(async () => ({
+        tools: [{ name: 'list_records', inputSchema: { type: 'object' } }],
+      })),
+    };
+    const options = {
+      ownerId,
+      baseUrl: 'http://localhost:4310',
+      grantVault: await createAppGrantVault(pool, { ownerId, keyStore }),
+      transport,
+      oauth: { begin: unused, finish: unused, refresh: unused },
+    };
+    const connections = await createDiscoveredConnections(pool, options);
+    connections.registerRoutes(app);
+    const foreignConnections = await createDiscoveredConnections(pool, {
+      ...options,
+      ownerId: 'foreign-owner',
+      grantVault: await createAppGrantVault(pool, { ownerId: 'foreign-owner', keyStore }),
+    });
+    foreignConnections.registerRoutes(foreign);
+    const token = 'synthetic-mcp-token';
+    const connect = async (server: typeof app, name: string, accountName: string) => {
+      const created = await server.inject({
+        method: 'POST',
+        url: '/api/apps/mcp',
+        payload: { name, endpoint: 'https://93.184.216.34/mcp', auth: 'bearer' },
+      });
+      assert.equal(created.statusCode, 200, created.body);
+      const done = await server.inject({
+        method: 'POST',
+        url: `/api/apps/discovery/${created.json().id}/complete`,
+        payload: { token, accountName },
+      });
+      assert.equal(done.statusCode, 200, done.body);
+    };
+    await connect(app, 'Fixture Research', 'Fixture account');
+    const before = (await connections.list())[0];
+    const id = before.connectionId!;
+    const service = before.slug;
+    assert.equal(before.canRename, true);
+    const args = { connectionId: id, pathId: before.accessPaths![0].id, tool: 'list_records' };
+    const approved = await connections.approvalDetails('CONNECTED_MCP_CALL', args);
+    const binding = await connections.binding(id);
+    const priorServers = await connections.servers();
+    assert.equal(priorServers.length, 1);
+    assert.equal(priorServers[0].name, 'Fixture Research');
+    const rename = (server: typeof app, service: string, payload: Record<string, unknown>) =>
+      server.inject({ method: 'PATCH', url: `/api/apps/mcp/${service}`, payload });
+
+    const catalogCalls = transport.listTools.mock.callCount();
+    const response = await rename(app, service, { name: '  Project Library MCP  ' });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.deepEqual(response.json(), { name: 'Project Library MCP' });
+    assert.equal((await options.grantVault.read(id))?.value, token);
+    assert.equal(await connections.binding(id), binding);
+    assert.deepEqual(await connections.approvalDetails('CONNECTED_MCP_CALL', args), {
+      ...approved,
+      account: { ...approved.account, name: 'Project Library MCP' },
+    });
+    const next = await connections.reconnect(service, id, 'apps', true);
+    assert.equal(next.name, 'Project Library MCP');
+    const setupPath = new URL(next.url, 'http://localhost').searchParams.get('connect');
+    const setup = await app.inject({ url: `/api/apps/discovery/${setupPath}` });
+    assert.equal(setup.json().name, 'Project Library MCP');
+    assert.deepEqual(await connections.servers(), [
+      { ...priorServers[0], name: 'Project Library MCP' },
+    ]);
+    for (const name of ['Project Library MCP', 'Fixture Research']) {
+      const { accounts } = await connections.search(name, id);
+      assert.equal(accounts[0].paths[0].kind, 'mcp');
+      assert.deepEqual((accounts[0].paths[0] as { toolNames?: string[] }).toolNames, [
+        'list_records',
+      ]);
+    }
+    assert.equal(transport.listTools.mock.callCount(), catalogCalls);
+    assert.equal((await rename(app, service, { name: ' ' })).statusCode, 400);
+    assert.equal(
+      (await rename(app, service, { name: 'Valid', endpoint: 'https://example.test/mcp' }))
+        .statusCode,
+      400,
+    );
+    assert.equal((await rename(app, 'notion', { name: 'Project Library' })).statusCode, 404);
+    assert.equal((await rename(foreign, service, { name: 'Foreign' })).statusCode, 404);
+    const added = await app.inject({
+      method: 'POST',
+      url: `/api/apps/discovery/${setupPath}/complete`,
+      payload: { token, accountName: 'Sibling account' },
+    });
+    assert.equal(added.statusCode, 200, added.body);
+    await connect(foreign, 'Fixture Research', 'Foreign account');
+    const saved = await connections.list();
+    const sibling = saved.find(({ accountName }) => accountName === 'Sibling account');
+    assert.equal(saved.length, 2);
+    assert.deepEqual(
+      saved.find(({ connectionId }) => connectionId === id),
+      {
+        ...before,
+        name: 'Project Library MCP',
+      },
+    );
+    assert.equal(sibling?.name, 'Project Library MCP');
+    assert.equal((await foreignConnections.list())[0].name, 'Fixture Research');
+    await connections.disconnect(id, service);
+    assert.equal((await connections.list())[0].name, 'Project Library MCP');
+    await connections.disconnect(sibling!.connectionId!, service);
+    await connect(app, 'New Cabinet', 'Fixture account');
+    assert.equal((await connections.list())[0].name, 'New Cabinet');
+  },
+);
+
+test(
   'manual MCP setup accepts an owner-typed private address and binds it to that origin',
   { skip: !process.env.TEST_DATABASE_URL },
   async (t) => {
@@ -14452,6 +14589,51 @@ test(
     const prepared = await f.service.prepare(owner, 'GITHUB_LIST_REPOSITORIES', {
       connectionId: connected.connectionId,
     });
+    for (const phase of ['session startup', 'before dispatch', 'after dispatch'])
+      await t.test(`approved action Stop during ${phase} keeps its dispatch outcome`, async () => {
+        const controller = new AbortController();
+        const stop = new Error('Synthetic boundary stop.');
+        const createSession = f.provider.createSession;
+        const execute = f.session.execute;
+        const before = f.executed.length;
+        f.provider.createSession = async (...args) => {
+          const session = await createSession(...args);
+          if (phase === 'session startup') controller.abort(stop);
+          return session;
+        };
+        f.session.execute = async (...args) => {
+          const result = await execute(...args);
+          if (phase === 'after dispatch') {
+            controller.abort(stop);
+            controller.signal.throwIfAborted();
+          }
+          return result;
+        };
+        try {
+          await assert.rejects(
+            f.service.executeApproved(
+              owner,
+              'GITHUB_LIST_REPOSITORIES',
+              prepared,
+              undefined,
+              controller.signal,
+              undefined,
+              async () => {
+                if (phase === 'before dispatch') controller.abort(stop);
+              },
+            ),
+            (error: Error & { notRun?: boolean }) => {
+              assert.match(error.message, /Synthetic boundary stop/);
+              assert.equal(error.notRun === true, phase !== 'after dispatch');
+              return true;
+            },
+          );
+          assert.equal(f.executed.length, before + (phase === 'after dispatch' ? 1 : 0));
+        } finally {
+          f.provider.createSession = createSession;
+          f.session.execute = execute;
+        }
+      });
     const execute = f.session.execute;
     for (const status of [400, 429, 503]) {
       f.session.execute = async () => {
@@ -14473,6 +14655,7 @@ test(
     ]);
     await assert.rejects(f.service.executeApproved(owner, 'GITHUB_LIST_REPOSITORIES', prepared), {
       statusCode: 404,
+      notRun: true,
     });
     await f.pool.query('UPDATE app_connections SET account_active=true WHERE id=$1', [
       connected.connectionId,
@@ -14487,7 +14670,16 @@ test(
     };
     await assert.rejects(f.service.executeApproved(owner, 'GITHUB_LIST_REPOSITORIES', prepared), {
       statusCode: 404,
+      notRun: true,
     });
+    assert.equal(f.executed.length, executions);
+    await f.pool.query('DELETE FROM app_connections WHERE id=$1', [connected.connectionId]);
+    const sessions = f.sessions.length;
+    await assert.rejects(f.service.executeApproved(owner, 'GITHUB_LIST_REPOSITORIES', prepared), {
+      statusCode: 404,
+      notRun: true,
+    });
+    assert.equal(f.sessions.length, sessions);
     assert.equal(f.executed.length, executions);
   },
 );
